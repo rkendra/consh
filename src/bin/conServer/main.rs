@@ -1,6 +1,7 @@
 use std::net::*;
 use std::env;
 use std::thread;
+use log::{info, warn, error};
 
 
 fn client_handler(sock: TcpStream) {
@@ -29,7 +30,8 @@ fn main() -> Result<(), std::io::Error> {
         Ok(p) => p,
         Err(e) => panic!("Unable to parse port argument, Reason: {}, is port a valid 16 bit integer?", e),
     };
+    env_logger::init();
 
-    println!("Server starting with port {}", port);
+    info!("Server starting with port {}", port);
     server_loop(port)
 }
