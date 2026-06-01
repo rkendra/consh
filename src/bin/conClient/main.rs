@@ -1,4 +1,4 @@
-use consh::Opcode;
+use consh::{Opcode, ConMsg};
 
 fn main() {
     println!("Hello from Client!");

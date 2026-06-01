@@ -5,3 +5,4 @@ edition = "2024"
 
 [dependencies]
 aws-lc-rs = "1.17.0"
+log = "0.4.30"

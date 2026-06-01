@@ -9,6 +9,6 @@ pub enum Opcode {
     TO,
 }
 
-struct ConMsg {
+pub struct ConMsg {
     
 }
