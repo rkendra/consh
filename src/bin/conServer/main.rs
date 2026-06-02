@@ -1,7 +1,8 @@
 use std::net::*;
 use std::env;
 use std::thread;
-use std::process::{Command, Stdio, ChildStdin, ChildStdout};
+use std::sync::mpsc;
+use std::process::{Command, Stdio, ChildStdin, ChildStdout, ChildStderr};
 use std::os::unix::process::CommandExt;
 use std::io::prelude::*;
 use std::io::BufReader;
@@ -21,8 +22,69 @@ fn handle_message(msg: String, pipe: &mut ChildStdin) -> Result<(), Box<dyn std:
     Ok(())
 }
 
+fn send_loop(queue: mpsc::Receiver<ConMsg>, sock: &mut TcpStream) {
+    info!("Sending output to {}", sock.peer_addr().unwrap());
+    let msg = queue.recv().unwrap();
+    let body: String = msg.to_string();
+    let bytes: &[u8] = body.as_bytes();
+    let bytes_len: usize = bytes.len();
+    let mut bytes_sent: usize = 0;
+    while bytes_sent < bytes_len {
+        match sock.write(&bytes[bytes_sent..]) {
+            Ok(n) => bytes_sent += n,
+            Err(_) => error!("Writing to TCP stream failed, retrying..."),
+        }
+    }
+}
 
-fn client_handler(sock: TcpStream) {
+fn shell_listener(sender: &mut mpsc::Sender<ConMsg>, pipe: &mut ChildStdout) {
+    let mut shell_out = BufReader::new(pipe);
+    loop {
+        let mut buf: [u8; 1024] = [0; 1024];
+        match shell_out.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                let mut vec = Vec::new();
+                vec.extend_from_slice(&buf[0..n]);
+                let body = String::from_utf8(vec).expect("Shell only uses UTF-8");
+                sender.send(ConMsg::Command(body));
+            },
+            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {
+                debug!("Interrupt occured, retrying");
+            },
+            Err(err) => {
+                error!("Fatal: {:?}", err);
+                return;
+            }
+        }
+    }
+    info!("EOF reached, terminating thread");
+}
+
+fn shell_err_listener(sender: &mut mpsc::Sender<ConMsg>, pipe: &mut ChildStderr) {
+    let mut shell_out = BufReader::new(pipe);
+    loop {
+        let mut buf: [u8; 1024] = [0; 1024];
+        match shell_out.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                let mut vec = Vec::new();
+                vec.extend_from_slice(&buf[0..n]);
+                let body = String::from_utf8(vec).expect("Shell only uses UTF-8");
+                sender.send(ConMsg::Error(body));
+            },
+            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {},
+            Err(err) => {
+                error!("Fatal: {:?}", err);
+                return;
+            }
+        }
+    }
+    info!("EOF reached, terminating thread");
+}
+
+
+fn client_handler(mut sock: TcpStream) {
     warn!("Actual user handshake not implemented yet, using canned username");
     let uname = String::from("ryanj");
     let uid: u32;
@@ -33,7 +95,7 @@ fn client_handler(sock: TcpStream) {
         // Read and parse line in passwd
         let mut buf = String::new();
         match passwd.read_line(&mut buf) {
-            Ok(n) if n == 0 => {
+            Ok(0) => {
                 error!("Fatal: requested user not found");
                 return;
             },
@@ -62,9 +124,20 @@ fn client_handler(sock: TcpStream) {
             .expect("Failed to start shell")
     };
 
-    let input = shell.stdin.take().expect("Failed to obtain stdin reference");
-    let output = shell.stdout.take().expect("Failed to obtain stdout reference");
-    let err_stream = shell.stderr.take().expect("Failed to obtain stderr reference");
+    let mut input = shell.stdin.take().expect("Failed to obtain stdin reference");
+    let mut output = shell.stdout.take().expect("Failed to obtain stdout reference");
+    let mut err_stream = shell.stderr.take().expect("Failed to obtain stderr reference");
+
+    let (mut tx, mut rx) = mpsc::channel();
+    let mut txe = tx.clone();
+
+    thread::scope( |s| {
+        info!("Beginning listening for shell serving {}", sock.peer_addr().unwrap());
+        s.spawn(|| shell_listener(&mut tx, &mut output));
+        s.spawn(|| shell_err_listener(&mut txe, &mut err_stream));
+        s.spawn(|| send_loop(rx, &mut sock));
+    })
+    
 }
 
 fn server_loop(port: u16) -> std::io::Result<()>{
