@@ -10,8 +10,8 @@ use std::fs::File;
 use log::{info, warn, error, debug};
 use consh::ConMsg;
 
-fn handle_message(msg: String, pipe: &mut ChildStdin) -> Result<(), Box<dyn std::error::Error>> {
-    let msg = ConMsg::from_string(msg)?;
+fn handle_message(msg: String, pipe: &mut ChildStdin, shutdown: &mut bool) -> Result<(), Box<dyn std::error::Error>> {
+    let msg = ConMsg::from_bytes(msg)?;
     match msg {
         ConMsg::Hello(_) => warn!("Operation not implemented yet"),
         ConMsg::Command(body) => pipe.write_all(body.as_bytes())?,
@@ -23,14 +23,20 @@ fn handle_message(msg: String, pipe: &mut ChildStdin) -> Result<(), Box<dyn std:
 }
 
 fn send_loop(queue: mpsc::Receiver<ConMsg>, sock: &mut TcpStream) {
-    info!("Sending output to {}", sock.peer_addr().unwrap());
-    let msg = queue.recv().unwrap();
-    let body: String = msg.to_string();
-    let bytes: &[u8] = body.as_bytes();
-    let bytes_len: usize = bytes.len();
+    info!("Send loop to {} started", sock.peer_addr().unwrap());
+    let msg: ConMsg;
+    match queue.recv() {
+        Ok(received) => msg = received,
+        Err(_) => {
+            info!("All references to sender closed, exiting...");
+            return;
+        }
+    }
+    let body: Vec<u8> = msg.to_bytes();
+    let bytes_len: usize = body.len();
     let mut bytes_sent: usize = 0;
     while bytes_sent < bytes_len {
-        match sock.write(&bytes[bytes_sent..]) {
+        match sock.write(&body[bytes_sent..]) {
             Ok(n) => bytes_sent += n,
             Err(_) => error!("Writing to TCP stream failed, retrying..."),
         }
@@ -47,7 +53,7 @@ fn shell_listener(sender: &mut mpsc::Sender<ConMsg>, pipe: &mut ChildStdout) {
                 let mut vec = Vec::new();
                 vec.extend_from_slice(&buf[0..n]);
                 let body = String::from_utf8(vec).expect("Shell only uses UTF-8");
-                sender.send(ConMsg::Command(body));
+                sender.send(ConMsg::Command(body)).expect("Receiving thread panicked/terminated early");
             },
             Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {
                 debug!("Interrupt occured, retrying");
@@ -71,7 +77,7 @@ fn shell_err_listener(sender: &mut mpsc::Sender<ConMsg>, pipe: &mut ChildStderr)
                 let mut vec = Vec::new();
                 vec.extend_from_slice(&buf[0..n]);
                 let body = String::from_utf8(vec).expect("Shell only uses UTF-8");
-                sender.send(ConMsg::Error(body));
+                sender.send(ConMsg::Error(body)).expect("Receiving thread panicked/terminated early");
             },
             Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {},
             Err(err) => {
@@ -108,8 +114,6 @@ fn client_handler(mut sock: TcpStream) {
         let user_info: Vec<&str> = buf.split(':').collect();
         if user_info[0] == uname {
             uid = user_info[2].parse().unwrap();
-            // start_sh = user_info[user_info.len() - 1].to_string();
-            // debug!("Uid: {uid}, Shell: {start_sh}");
             break;
         }
     }
@@ -135,7 +139,9 @@ fn client_handler(mut sock: TcpStream) {
         info!("Beginning listening for shell serving {}", sock.peer_addr().unwrap());
         s.spawn(|| shell_listener(&mut tx, &mut output));
         s.spawn(|| shell_err_listener(&mut txe, &mut err_stream));
-        s.spawn(|| send_loop(rx, &mut sock));
+        s.spawn(|| send_loop(&mut rx, &mut sock));
+
+        
     })
     
 }
