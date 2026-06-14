@@ -2,15 +2,14 @@ use std::net::*;
 use std::env;
 use std::thread;
 use std::sync::mpsc;
-use std::process::{Command, Stdio, ChildStdin, ChildStdout, ChildStderr};
-use std::os::unix::process::CommandExt;
+use subterminal::Pty;
 use std::io::prelude::*;
 use std::io::BufReader;
 use std::fs::File;
 use log::{info, warn, error, debug};
 use consh::ConMsg;
 
-fn handle_message(msg: String, pipe: &mut ChildStdin, shutdown: &mut bool) -> Result<(), Box<dyn std::error::Error>> {
+fn handle_message(msg: String, pipe: &mut Pty, shutdown: &mut bool) -> Result<(), Box<dyn std::error::Error>> {
     let msg = ConMsg::from_bytes(msg)?;
     match msg {
         ConMsg::Hello(_) => warn!("Operation not implemented yet"),
@@ -43,7 +42,7 @@ fn send_loop(queue: mpsc::Receiver<ConMsg>, sock: &mut TcpStream) {
     }
 }
 
-fn shell_listener(sender: &mut mpsc::Sender<ConMsg>, pipe: &mut ChildStdout) {
+fn shell_listener(sender: &mut mpsc::Sender<ConMsg>, pipe: &mut Pty) {
     let mut shell_out = BufReader::new(pipe);
     loop {
         let mut buf: [u8; 1024] = [0; 1024];
@@ -67,30 +66,8 @@ fn shell_listener(sender: &mut mpsc::Sender<ConMsg>, pipe: &mut ChildStdout) {
     info!("EOF reached, terminating thread");
 }
 
-fn shell_err_listener(sender: &mut mpsc::Sender<ConMsg>, pipe: &mut ChildStderr) {
-    let mut shell_out = BufReader::new(pipe);
-    loop {
-        let mut buf: [u8; 1024] = [0; 1024];
-        match shell_out.read(&mut buf) {
-            Ok(0) => break,
-            Ok(n) => {
-                let mut vec = Vec::new();
-                vec.extend_from_slice(&buf[0..n]);
-                let body = String::from_utf8(vec).expect("Shell only uses UTF-8");
-                sender.send(ConMsg::Error(body)).expect("Receiving thread panicked/terminated early");
-            },
-            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {},
-            Err(err) => {
-                error!("Fatal: {:?}", err);
-                return;
-            }
-        }
-    }
-    info!("EOF reached, terminating thread");
-}
 
-
-fn client_handler(mut sock: TcpStream) {
+fn client_handler(mut sock: TcpStream) -> std::io::Result<()> {
     warn!("Actual user handshake not implemented yet, using canned username");
     let uname = String::from("ryanj");
     let uid: u32;
@@ -103,7 +80,7 @@ fn client_handler(mut sock: TcpStream) {
         match passwd.read_line(&mut buf) {
             Ok(0) => {
                 error!("Fatal: requested user not found");
-                return;
+                return Err(std::io::Error::new(std::io::ErrorKind::Other, "No such user found"));
             },
             Err(_) => {
                 error!("Fatal: could not read /etc/passwd");
@@ -119,31 +96,19 @@ fn client_handler(mut sock: TcpStream) {
     }
     start_sh = String::from("bash");
     // Start bash subprocess
-    let mut shell = {
-        Command::new(start_sh)
-            .uid(uid)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .spawn()
-            .expect("Failed to start shell")
-    };
-
-    let mut input = shell.stdin.take().expect("Failed to obtain stdin reference");
-    let mut output = shell.stdout.take().expect("Failed to obtain stdout reference");
-    let mut err_stream = shell.stderr.take().expect("Failed to obtain stderr reference");
+    let mut shell = Pty::spawn_shell()?;
 
     let (mut tx, mut rx) = mpsc::channel();
     let mut txe = tx.clone();
 
     thread::scope( |s| {
         info!("Beginning listening for shell serving {}", sock.peer_addr().unwrap());
-        s.spawn(|| shell_listener(&mut tx, &mut output));
-        s.spawn(|| shell_err_listener(&mut txe, &mut err_stream));
-        s.spawn(|| send_loop(&mut rx, &mut sock));
+        s.spawn(|| shell_listener(&mut tx, &mut shell));
+        s.spawn(|| send_loop(rx, &mut sock));
 
         
-    })
-    
+    });
+   Ok(()) 
 }
 
 fn server_loop(port: u16) -> std::io::Result<()>{
