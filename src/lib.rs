@@ -46,7 +46,7 @@ impl ConMsg {
         out
     }
 
-    pub fn from_bytes(msg: String) -> Result<ConMsg, &'static str> {
+    pub fn from_bytes(msg: String) -> std::io::Result<ConMsg> {
         let msg = msg.split(":").collect::<Vec<&str>>()[1];
         match msg.chars().nth(0) {
             Some('0') => Ok(Hello(msg[1..].to_string())),
@@ -54,7 +54,7 @@ impl ConMsg {
             Some('2') => Ok(Command(msg[1..].to_string())),
             Some('3') => Ok(Error(msg[1..].to_string())),
             Some('4') => Ok(Timeout(msg[1..].to_string())),
-            _ => Err("Invalid message type")
+            _ => Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "Unable to parse string")),
         }
     }
 }
