@@ -6,5 +6,6 @@ edition = "2024"
 [dependencies]
 aws-lc-rs = "1.17.0"
 colog = "1.4.0"
+libc = "0.2.186"
 log = "0.4.30"
 subterminal = { version = "0.1.0", path = "../subterminal" }

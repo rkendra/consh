@@ -42,7 +42,7 @@ fn send_loop(queue: mpsc::Receiver<ConMsg>, sock: Arc<Mutex<TcpStream>>) {
     }
 }
 
-fn shell_listener(sender: &mut mpsc::Sender<ConMsg>, pipe: &mut PtyOut) {
+fn shell_listener(sender: mpsc::Sender<ConMsg>, pipe: &mut PtyOut) {
     let mut shell_out = BufReader::new(pipe);
     loop {
         let mut buf: [u8; 1024] = [0; 1024];
@@ -70,7 +70,7 @@ fn shell_listener(sender: &mut mpsc::Sender<ConMsg>, pipe: &mut PtyOut) {
 fn client_handler(sock: TcpStream) -> std::io::Result<()> {
     warn!("Actual user handshake not implemented yet, using canned username");
     let uname = String::from("ryanj");
-    // get uid of uname from /etc/passwd
+    // Check /etc/passwd to ensure that desired user actually exists
     let mut passwd = BufReader::new(File::open("/etc/passwd").expect("Unable to open /etc/passwd"));
     loop {
         // Read and parse line in passwd
@@ -98,7 +98,7 @@ fn client_handler(sock: TcpStream) -> std::io::Result<()> {
     let sock = Arc::new(Mutex::new(sock));
 
     thread::scope( |s| -> std::io::Result<()> {
-        s.spawn(|| shell_listener(&mut tx.clone(), &mut shell.output));
+        s.spawn(|| shell_listener(tx.clone(), &mut shell.output));
         s.spawn(|| send_loop(rx, sock.clone()));
         let mut shutdown = false;
         while !shutdown {
@@ -111,6 +111,8 @@ fn client_handler(sock: TcpStream) -> std::io::Result<()> {
     })
 }
 
+// Listen for new clients on the connection, creating
+// a new client thread for each one
 fn server_loop(port: u16) -> std::io::Result<()>{
     let addr = format!("0.0.0.0:{}", port);
     let server = TcpListener::bind(addr)?;
@@ -124,6 +126,7 @@ fn server_loop(port: u16) -> std::io::Result<()>{
 
 fn main() -> Result<(), std::io::Error> {
     let args: Vec<String> = env::args().collect();
+    //TODO; Add more sophisticated argument parsing (external crate?)
     if args.len() < 2 {
         println!("Usage: ./conServer [port]");
         println!("Where port is a valid 16 bit integer");
@@ -134,6 +137,8 @@ fn main() -> Result<(), std::io::Error> {
         Ok(p) => p,
         Err(e) => panic!("Unable to parse port argument, Reason: {}, is port a valid 16 bit integer?", e),
     };
+
+    // Log level is Debug for debug builds, info for release builds
     let mut clog = colog::default_builder();
     if cfg!(debug_assertions) {
         clog.filter(None, log::LevelFilter::Debug);
