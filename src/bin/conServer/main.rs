@@ -57,8 +57,8 @@ fn shell_listener(sender: mpsc::Sender<ConMsg>, pipe: &mut PtyOut) {
             Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {
                 debug!("Interrupt occured, retrying");
             },
-            Err(err) => {
-                error!("Fatal: {:?}", err);
+            Err(_) => {
+                error!("Fatal: {:?}", std::io::Error::last_os_error());
                 return;
             }
         }
@@ -92,6 +92,8 @@ fn client_handler(sock: TcpStream) -> std::io::Result<()> {
         }
     }
     // Start bash subprocess
+    let cmd = format!("su {uname}");
+    debug!("command to be ran is {}", cmd);
     let mut shell = Pty::spawn_shell(format!("su {uname}"))?;
 
     let (tx, rx) = mpsc::channel();

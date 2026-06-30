@@ -5,7 +5,7 @@ use std::net::TcpStream;
 use std::thread;
 use std::sync::{atomic}; 
 
-fn handle_message(msg: String) -> Result<()> {
+fn handle_message(msg: String, shutdown: &atomic::AtomicBool) -> Result<()> {
     let msg = ConMsg::from_bytes(msg)?;
     match msg {
         ConMsg::Hello(_) => println!("Operation currently unsupported"),
@@ -13,7 +13,7 @@ fn handle_message(msg: String) -> Result<()> {
             let mut stdout = std::io::stdout();
             stdout.write_all(string.as_bytes())?;
         },
-        ConMsg::End(_) => println!("Operation currently unsupported"),
+        ConMsg::End(_) => shutdown.store(true, atomic::Ordering::Relaxed),
         ConMsg::Error(_) => println!("Operation currently unsupported"),
         ConMsg::Timeout(_) => println!("Operation currently unsupported"),
     }
@@ -37,7 +37,7 @@ fn read_loop(mut sock: TcpStream, shutdown: &atomic::AtomicBool) -> Result<()> {
                 Err(e) => return Err(e),
             }
         }
-        handle_message(String::from_utf8(msg).expect("Server only sends UTF-8"))?;
+        handle_message(String::from_utf8(msg).expect("Server only sends UTF-8"), shutdown)?;
     }
     Ok(())
 }
@@ -46,11 +46,45 @@ fn client() -> Result<()> {
     // TODO: Add config, currently using canned example
     let port: u16 = 8080;
     let host = "localhost";
-    let sock = TcpStream::connect((host, port))?;
+    let mut sock = TcpStream::connect((host, port))?;
     let shutdown = atomic::AtomicBool::new(false);
+    let mut stdin = std::io::stdin();
     thread::scope( |s| -> Result<()> {
-        s.spawn(|| read_loop(sock.try_clone()?, &shutdown));
-        shutdown.store(true, atomic::Ordering::Relaxed);
+        let listener = sock.try_clone()?;
+        s.spawn(|| read_loop(listener, &shutdown));
+        while !shutdown.load(atomic::Ordering::Relaxed) {
+            let mut buf: [u8; 1024] = [0; 1024];
+            match stdin.read(&mut buf) {
+                Ok(n) if n == 1 => {
+                    if buf[0] == 4 {
+                        let end_msg = ConMsg::End(String::new());
+                        sock.write_all(&end_msg.to_bytes())?;
+                    } else {
+                        let msg = match String::from_utf8(buf[..n].to_vec()) {
+                            Ok(data) => data,
+                            Err(_) => { 
+                                shutdown.store(true, atomic::Ordering::Relaxed);
+                                return Err(Error::new(std::io::ErrorKind::InvalidInput, "Input is not valid UTF-8"));
+                            }
+                        };
+                        let msg = ConMsg::Command(msg);
+                        sock.write_all(&msg.to_bytes())?;
+                    }
+                },
+                Ok(n) => {
+                    let msg = match String::from_utf8(buf[..n].to_vec()) {
+                        Ok(data) => data,
+                        Err(_) => { 
+                            shutdown.store(true, atomic::Ordering::Relaxed);
+                            return Err(Error::new(std::io::ErrorKind::InvalidInput, "Input is not valid UTF-8"));
+                        }
+                    };
+                    let msg = ConMsg::Command(msg);
+                    sock.write_all(&msg.to_bytes())?;
+                }
+                Err(e) => return Err(e),
+            }
+        }
         Ok(()) 
     })
 }
