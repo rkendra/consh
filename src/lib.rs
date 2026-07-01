@@ -47,7 +47,6 @@ impl ConMsg {
     }
 
     pub fn from_bytes(msg: String) -> std::io::Result<ConMsg> {
-        let msg = msg.split(":").collect::<Vec<&str>>()[1];
         match msg.chars().nth(0) {
             Some('0') => Ok(Hello(msg[1..].to_string())),
             Some('1') => Ok(End(msg[1..].to_string())),

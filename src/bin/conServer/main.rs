@@ -21,32 +21,34 @@ fn handle_message(msg: String, pipe: &mut PtyIn, shutdown: &mut bool) -> std::io
     Ok(())
 }
 
-fn send_loop(queue: mpsc::Receiver<ConMsg>, sock: Arc<Mutex<TcpStream>>) {
-    let msg: ConMsg;
-    match queue.recv() {
-        Ok(received) => msg = received,
-        Err(_) => {
-            info!("All references to sender closed, exiting...");
-            return;
+fn send_loop(queue: mpsc::Receiver<ConMsg>, mut sock: TcpStream) {
+    info!("Sender thread started");
+    loop {
+        let msg: ConMsg;
+        match queue.recv() {
+            Ok(received) => msg = received,
+            Err(_) => {
+                info!("All references to sender closed, exiting...");
+                return;
+            }
         }
-    }
-    let body: Vec<u8> = msg.to_bytes();
-    let bytes_len: usize = body.len();
-    let mut bytes_sent: usize = 0;
-    while bytes_sent < bytes_len {
-        let mut sock = sock.lock().unwrap();
-        match sock.write(&body[bytes_sent..]) {
-            Ok(n) => bytes_sent += n,
-            Err(_) => error!("Writing to TCP stream failed, retrying..."),
+        let body: Vec<u8> = msg.to_bytes();
+        let bytes_len: usize = body.len();
+        let mut bytes_sent: usize = 0;
+        while bytes_sent < bytes_len {
+            match sock.write(&body[bytes_sent..]) {
+                Ok(n) => bytes_sent += n,
+                Err(_) => error!("Writing to TCP stream failed, retrying..."),
+            }
         }
     }
 }
 
 fn shell_listener(sender: mpsc::Sender<ConMsg>, pipe: &mut PtyOut) {
-    let mut shell_out = BufReader::new(pipe);
+    info!("Pty listener thread started");
     loop {
         let mut buf: [u8; 1024] = [0; 1024];
-        match shell_out.read(&mut buf) {
+        match pipe.read(&mut buf) {
             Ok(0) => break,
             Ok(n) => {
                 let mut vec = Vec::new();
@@ -67,7 +69,7 @@ fn shell_listener(sender: mpsc::Sender<ConMsg>, pipe: &mut PtyOut) {
 }
 
 
-fn client_handler(sock: TcpStream) -> std::io::Result<()> {
+fn client_handler(mut sock: TcpStream) -> std::io::Result<()> {
     warn!("Actual user handshake not implemented yet, using canned username");
     let uname = String::from("ryanj");
     // Check /etc/passwd to ensure that desired user actually exists
@@ -94,20 +96,34 @@ fn client_handler(sock: TcpStream) -> std::io::Result<()> {
     // Start bash subprocess
     let cmd = format!("su {uname}");
     debug!("command to be ran is {}", cmd);
-    let mut shell = Pty::spawn_shell(format!("su {uname}"))?;
+    let mut shell = Pty::spawn_shell(String::from("/usr/bin/bash"))?;
 
     let (tx, rx) = mpsc::channel();
-    let sock = Arc::new(Mutex::new(sock));
-
+    let sender = sock.try_clone()?;
     thread::scope( |s| -> std::io::Result<()> {
+        s.spawn(move || -> std::io::Result<()> {
+            send_loop(rx, sender);
+            Ok(())
+        });
         s.spawn(|| shell_listener(tx.clone(), &mut shell.output));
-        s.spawn(|| send_loop(rx, sock.clone()));
         let mut shutdown = false;
         while !shutdown {
-            let mut buf: [u8; 4096] = [0; 4096];
-            let mut sock = sock.lock().unwrap();
-            let bytes_read = sock.read(&mut buf)?;
-            handle_message(str::from_utf8(&buf[..bytes_read]).unwrap().to_string(), &mut shell.input, &mut shutdown)?;
+            let mut len_bytes: [u8; 4] = [0; 4];
+            sock.read(&mut len_bytes)?;
+            let msg_len = u32::from_be_bytes(len_bytes);
+            let mut bytes_recd = 0;
+            let mut msg = Vec::new();
+            while bytes_recd < msg_len {
+                let mut buf: Vec<u8> = vec![0; (msg_len - bytes_recd) as usize];
+                match sock.read(&mut buf) {
+                    Ok(n) => {
+                        bytes_recd += n as u32;
+                        msg.extend_from_slice(&buf[..n]);
+                    },
+                    Err(e) => return Err(e),
+                }
+            }
+            handle_message(str::from_utf8(&msg).unwrap().to_string(), &mut shell.input, &mut shutdown)?;
         }
         Ok(())
     })

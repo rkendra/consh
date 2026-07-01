@@ -12,6 +12,7 @@ fn handle_message(msg: String, shutdown: &atomic::AtomicBool) -> Result<()> {
         ConMsg::Command(string) => {
             let mut stdout = std::io::stdout();
             stdout.write_all(string.as_bytes())?;
+            stdout.flush();
         },
         ConMsg::End(_) => shutdown.store(true, atomic::Ordering::Relaxed),
         ConMsg::Error(_) => println!("Operation currently unsupported"),
