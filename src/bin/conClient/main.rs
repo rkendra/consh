@@ -12,7 +12,7 @@ fn handle_message(msg: String, shutdown: &atomic::AtomicBool) -> Result<()> {
         ConMsg::Command(string) => {
             let mut stdout = std::io::stdout();
             stdout.write_all(string.as_bytes())?;
-            stdout.flush();
+            stdout.flush()?;
         },
         ConMsg::End(_) => shutdown.store(true, atomic::Ordering::Relaxed),
         ConMsg::Error(_) => println!("Operation currently unsupported"),
@@ -52,14 +52,16 @@ fn client() -> Result<()> {
     let mut stdin = std::io::stdin();
     thread::scope( |s| -> Result<()> {
         let listener = sock.try_clone()?;
-        s.spawn(|| read_loop(listener, &shutdown));
-        while !shutdown.load(atomic::Ordering::Relaxed) {
+        let reader = s.spawn(|| read_loop(listener, &shutdown));
+        let mut keep_reading = true;
+        while keep_reading && !shutdown.load(atomic::Ordering::Relaxed) {
             let mut buf: [u8; 1024] = [0; 1024];
             match stdin.read(&mut buf) {
                 Ok(n) if n == 1 => {
                     if buf[0] == 4 {
                         let end_msg = ConMsg::End(String::new());
                         sock.write_all(&end_msg.to_bytes())?;
+                        keep_reading = false;
                     } else {
                         let msg = match String::from_utf8(buf[..n].to_vec()) {
                             Ok(data) => data,
@@ -86,10 +88,11 @@ fn client() -> Result<()> {
                 Err(e) => return Err(e),
             }
         }
+        let _ = reader.join();
         Ok(()) 
     })
 }
-fn main() {
+fn main() -> Result<()>{
     // Set terminal into raw mode
     // SAFETY: termios struct guaranteed to be initialized by libc::tcgetattr
     let reset: MaybeUninit<libc::termios>;
@@ -117,17 +120,20 @@ fn main() {
         // SAFETY: reset guaranteed to have previous state assuming no panics
         unsafe {
             let reset = panic_reset.assume_init();
-            libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &reset);
+            libc::tcsetattr(libc::STDIN_FILENO, libc::TCSAFLUSH, &reset);
         }
         panicker(info);
     }));
 
     let _ = client();
 
+    std::io::stdout().write(b"\x1b[?25h\x1b[0m\r\n")?;
+    std::io::stdout().flush()?;
     // Reset terminal to previous state before quitting
     // SAFETY: reset guaranteed to have previous state assuming no panics
     unsafe {
         let reset = reset.assume_init();
-        libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &reset);
+        libc::tcsetattr(libc::STDIN_FILENO, libc::TCSAFLUSH, &reset);
     }
+    Ok(())
 }

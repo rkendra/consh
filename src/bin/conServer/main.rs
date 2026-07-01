@@ -125,6 +125,8 @@ fn client_handler(mut sock: TcpStream) -> std::io::Result<()> {
             }
             handle_message(str::from_utf8(&msg).unwrap().to_string(), &mut shell.input, &mut shutdown)?;
         }
+        let end = ConMsg::End(String::new());
+        sock.write_all(&end.to_bytes())?;
         Ok(())
     })
 }
