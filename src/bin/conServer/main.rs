@@ -1,7 +1,7 @@
 use std::net::*;
 use std::env;
 use std::thread;
-use std::sync::{Arc, Mutex, mpsc};
+use std::sync::mpsc;
 use subterminal::{Pty, PtyIn, PtyOut};
 use std::io::prelude::*;
 use std::io::BufReader;
