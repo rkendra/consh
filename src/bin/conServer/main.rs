@@ -94,9 +94,10 @@ fn client_handler(mut sock: TcpStream) -> std::io::Result<()> {
         }
     }
     // Start bash subprocess
-    let cmd = format!("su {uname}");
+    let cmd = format!("/usr/bin/bash");
     debug!("command to be ran is {}", cmd);
-    let mut shell = Pty::spawn_shell(String::from("/usr/bin/bash"))?;
+    let mut shell = Pty::spawn_as_user(&cmd, &uname)?;
+    thread::sleep(std::time::Duration::from_millis(10));
 
     let (tx, rx) = mpsc::channel();
     let sender = sock.try_clone()?;
