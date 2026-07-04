@@ -24,14 +24,13 @@ fn handle_message(msg: String, pipe: &mut PtyIn, shutdown: &mut bool) -> std::io
 fn send_loop(queue: mpsc::Receiver<ConMsg>, mut sock: TcpStream) {
     info!("Sender thread started");
     loop {
-        let msg: ConMsg;
-        match queue.recv() {
-            Ok(received) => msg = received,
+        let msg: ConMsg = match queue.recv() {
+            Ok(received) => received,
             Err(_) => {
                 info!("All references to sender closed, exiting...");
                 return;
             }
-        }
+        };
         let body: Vec<u8> = msg.to_bytes();
         let bytes_len: usize = body.len();
         let mut bytes_sent: usize = 0;
@@ -80,7 +79,7 @@ fn client_handler(mut sock: TcpStream) -> std::io::Result<()> {
         match passwd.read_line(&mut buf) {
             Ok(0) => {
                 error!("Fatal: requested user not found");
-                return Err(std::io::Error::new(std::io::ErrorKind::Other, "No such user found"));
+                return Err(std::io::Error::other("No such user found"));
             },
             Err(_) => {
                 error!("Fatal: could not read /etc/passwd");
@@ -94,7 +93,7 @@ fn client_handler(mut sock: TcpStream) -> std::io::Result<()> {
         }
     }
     // Start bash subprocess
-    let cmd = format!("/usr/bin/bash");
+    let cmd = String::from("/usr/bin/bash");
     debug!("command to be ran is {}", cmd);
     let mut shell = Pty::spawn_as_user(&cmd, &uname)?;
     thread::sleep(std::time::Duration::from_millis(10));
@@ -110,7 +109,7 @@ fn client_handler(mut sock: TcpStream) -> std::io::Result<()> {
         let mut shutdown = false;
         while !shutdown {
             let mut len_bytes: [u8; 4] = [0; 4];
-            sock.read(&mut len_bytes)?;
+            sock.read_exact(&mut len_bytes)?;
             let msg_len = u32::from_be_bytes(len_bytes);
             let mut bytes_recd = 0;
             let mut msg = Vec::new();

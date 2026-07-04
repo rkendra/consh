@@ -24,7 +24,7 @@ fn handle_message(msg: String, shutdown: &atomic::AtomicBool) -> Result<()> {
 fn read_loop(mut sock: TcpStream, shutdown: &atomic::AtomicBool) -> Result<()> {
     while !shutdown.load(atomic::Ordering::Relaxed) {
         let mut len_bytes: [u8; 4] = [0; 4];
-        sock.read(&mut len_bytes)?;
+        sock.read_exact(&mut len_bytes)?;
         let msg_len = u32::from_be_bytes(len_bytes);
         let mut bytes_recd = 0;
         let mut msg = Vec::new();
@@ -98,22 +98,20 @@ fn main() -> Result<()>{
     let reset: MaybeUninit<libc::termios>;
     unsafe {
         let mut flags: MaybeUninit<libc::termios> = MaybeUninit::uninit();
-        match libc::tcgetattr(libc::STDIN_FILENO, flags.as_mut_ptr()) {
-            -1 => panic!("Failed to get terminal info, is stdin a terminal?"),
-            _ => {}
+        if libc::tcgetattr(libc::STDIN_FILENO, flags.as_mut_ptr()) == -1 {
+            panic!("Failed to get terminal info, is stdin a terminal?");
         }
-        reset = flags.clone();
+        reset = flags;
         let mut flags = flags.assume_init();
         libc::cfmakeraw(&mut flags);
-        match libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &flags) {
-            -1 => panic!("Failed to set terminal to raw mode"),
-            _ => {}
+        if libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &flags) == -1 {
+            panic!("Failed to set terminal to raw mode");
         }
     }
 
     // Define custom panic handler that resets terminal to default settings
     // then executes the default panic handler
-    let panic_reset = reset.clone();
+    let panic_reset = reset;
     let panicker = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         // Reset terminal to previous state before quitting
@@ -127,7 +125,7 @@ fn main() -> Result<()>{
 
     let _ = client();
 
-    std::io::stdout().write(b"\x1b[?25h\x1b[0m\r\n")?;
+    std::io::stdout().write_all(b"\x1b[?25h\x1b[0m\r\n")?;
     std::io::stdout().flush()?;
     // Reset terminal to previous state before quitting
     // SAFETY: reset guaranteed to have previous state assuming no panics
