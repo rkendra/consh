@@ -1,5 +1,4 @@
 use std::net::*;
-use std::env;
 use std::thread;
 use std::sync::mpsc;
 use subterminal::{Pty, PtyIn, PtyOut};
@@ -7,7 +6,31 @@ use std::io::prelude::*;
 use std::io::BufReader;
 use std::fs::File;
 use log::{info, warn, error, debug};
+use clap::{Parser, Subcommand};
 use consh::ConMsg;
+
+#[derive(Parser)]
+#[command(version, about, long_about = None)]
+struct Argv {
+
+    #[command(subcommand)]
+    command: Commands
+}
+#[derive(Subcommand)]
+enum Commands {
+    Run {
+        /// Port for the server to run on
+        #[arg(short, long, value_name = "PORT", default_value_t = 1618)]
+        port: u16,
+    },
+
+    Keygen {
+        /// User to generate a key for, must be logged in user if
+        /// command is not run with root priveliges
+        #[arg(short, long, value_name = "USER")]
+        uname: String
+    }
+}
 
 fn handle_message(msg: String, pipe: &mut PtyIn, shutdown: &mut bool) -> std::io::Result<()> {
     let msg = ConMsg::from_bytes(msg)?;
@@ -58,6 +81,11 @@ fn shell_listener(sender: mpsc::Sender<ConMsg>, pipe: &mut PtyOut) {
             Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {
                 debug!("Interrupt occured, retrying");
             },
+            // Unix-systems will send EIO if a pty's child closes early
+            Err(err) if err.raw_os_error() == Some(libc::EIO) => {
+                info!("Inner PTY process closed, exiting...");
+                break;
+            },
             Err(_) => {
                 error!("Fatal: {:?}", std::io::Error::last_os_error());
                 return;
@@ -67,10 +95,8 @@ fn shell_listener(sender: mpsc::Sender<ConMsg>, pipe: &mut PtyOut) {
     info!("EOF reached, terminating thread");
 }
 
-
-fn client_handler(mut sock: TcpStream) -> std::io::Result<()> {
-    warn!("Actual user handshake not implemented yet, using canned username");
-    let uname = String::from("ryanj");
+#[cfg(target_os = "linux")]
+fn user_exists(uname: &str) -> bool {
     // Check /etc/passwd to ensure that desired user actually exists
     let mut passwd = BufReader::new(File::open("/etc/passwd").expect("Unable to open /etc/passwd"));
     loop {
@@ -79,18 +105,52 @@ fn client_handler(mut sock: TcpStream) -> std::io::Result<()> {
         match passwd.read_line(&mut buf) {
             Ok(0) => {
                 error!("Fatal: requested user not found");
-                return Err(std::io::Error::other("No such user found"));
+                return false;
             },
             Err(_) => {
                 error!("Fatal: could not read /etc/passwd");
+                return false;
             },
             _ => {}
         }
         
         let user_info: Vec<&str> = buf.split(':').collect();
         if user_info[0] == uname {
-            break;
+            return true;
         }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn user_exists(uname: &str) -> bool {
+    let userlist = {
+        std::process::Command::new("dscl")
+            .args([".", "-ls", "/Users"])
+            .output()
+            .expect("Failed to fetch user list")
+    };
+    let users = BufReader::new(userlist.stdout);
+    loop {
+        let mut buf = String::new();
+        match users.read_line(&mut buf) {
+            Ok(0) => return false,
+            Err(_) => {
+                error!("Could not read user list");
+                return false;
+            },
+            _ => {}
+        }
+        if buf == uname {
+            return true;
+        }
+    }
+}
+
+fn client_handler(mut sock: TcpStream) -> std::io::Result<()> {
+    warn!("Actual user handshake not implemented yet, using canned username");
+    let uname = "ryanj";
+    if !user_exists(uname) {
+        return Err(std::io::Error::other("User not found"));
     }
     // Start bash subprocess
     let cmd = String::from("/usr/bin/bash");
@@ -105,7 +165,7 @@ fn client_handler(mut sock: TcpStream) -> std::io::Result<()> {
             send_loop(rx, sender);
             Ok(())
         });
-        s.spawn(|| shell_listener(tx.clone(), &mut shell.output));
+        s.spawn(|| shell_listener(tx, &mut shell.output));
         let mut shutdown = false;
         while !shutdown {
             let mut len_bytes: [u8; 4] = [0; 4];
@@ -126,6 +186,7 @@ fn client_handler(mut sock: TcpStream) -> std::io::Result<()> {
             handle_message(str::from_utf8(&msg).unwrap().to_string(), &mut shell.input, &mut shutdown)?;
         }
         let end = ConMsg::End(String::new());
+        shell.input.write_all(b"\x04")?;
         sock.write_all(&end.to_bytes())?;
         Ok(())
     })
@@ -145,24 +206,21 @@ fn server_loop(port: u16) -> std::io::Result<()>{
 }
 
 fn main() -> Result<(), std::io::Error> {
-    let args: Vec<String> = env::args().collect();
+    let args = Argv::parse();
     //TODO; Add more sophisticated argument parsing (external crate?)
-    if args.len() < 2 {
-        println!("Usage: ./conServer [port]");
-        println!("Where port is a valid 16 bit integer");
-        return Err(std::io::Error::other("Invalid command line arguments"));
+    match &args.command {
+        Commands::Run { port } => {
+            // Log level is Debug for debug builds, info for release builds
+            let mut clog = colog::default_builder();
+            if cfg!(debug_assertions) {
+                clog.filter(None, log::LevelFilter::Debug);
+            }
+            clog.init();
+            server_loop(*port)
+        }
+        Commands::Keygen { uname } => {
+            println!("Pretending to generate key for {}", *uname);
+            Ok(())
+        }
     }
-    let port: Result<u16, std::num::ParseIntError> = args[1].parse::<u16>();
-    let port = match port {
-        Ok(p) => p,
-        Err(e) => panic!("Unable to parse port argument, Reason: {}, is port a valid 16 bit integer?", e),
-    };
-
-    // Log level is Debug for debug builds, info for release builds
-    let mut clog = colog::default_builder();
-    if cfg!(debug_assertions) {
-        clog.filter(None, log::LevelFilter::Debug);
-    }
-    clog.init();
-    server_loop(port)
 }
