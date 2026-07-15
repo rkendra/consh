@@ -1,11 +1,97 @@
 use consh::ConMsg;
-use std::io::{Result, Error, Read, Write};
+use std::io::{Error, Read, Write};
 use std::mem::MaybeUninit;
 use std::net::TcpStream;
 use std::thread;
-use std::sync::{atomic}; 
+use std::sync::{atomic};
+use std::path::Path;
+use clap::{Parser, Subcommand, ValueEnum};
+use aws_lc_rs::unstable::signature::{PqdsaKeyPair, PqdsaSigningAlgorithm, ML_DSA_44_SIGNING, ML_DSA_65_SIGNING, ML_DSA_87_SIGNING};
+use aws_lc_rs::error::{KeyRejected, Unspecified};
+use aws_lc_rs::signature::KeyPair;
 
-fn handle_message(msg: String, shutdown: &atomic::AtomicBool) -> Result<()> {
+#[derive(Parser)]
+#[command(version, about, long_about = None)]
+struct Argv {
+   #[command(subcommand)]
+    cmd: Ops,
+}
+
+#[derive(Subcommand)]
+enum Ops {
+    Run {
+        /// The address of the host, leaving this blank will automatically
+        /// select the default host (if one exists)
+        #[arg(short = 'o', long)]
+        hostname: Option<String>,
+
+        /// The port the host is listening on (if not default)
+        #[arg(short, long, default_value_t = 1618)]
+        port: u16
+    },
+
+    /// Generate an authentication keypair for the current user/machine combination
+    Keygen {
+        /// The algorithm to use (default MLDSA-44)
+        #[arg(value_enum, short, long, default_value_t = Algorithms::MLDSA44)]
+        algorithm: Algorithms,
+        
+        #[arg(short, long, default_value_t = String::from("."))]
+        path: String,
+    }
+}
+
+#[derive(ValueEnum, Clone)]
+enum Algorithms {
+    MLDSA44,
+    MLDSA65,
+    MLDSA87,
+}
+
+fn generate_key(algo: Algorithms, path: &Path) -> Result<(), Unspecified> {
+    if path.join("mldsa").exists() && path.join("mldsa.pub").exists() {
+        let stdin = std::io::stdin();
+        print!("An associated key pair already exists at this path, overwrite? (y/N): ");
+        loop {
+            let mut buf = String::new();
+            match stdin.read_line(&mut buf) {
+                Ok(0) => return Ok(()),
+                Ok(_) => {
+                    buf = buf.to_lowercase();
+                    let yeses = vec!["y", "yes"];
+                    let nos = vec!["n", "no"];
+                    if yeses.contains(&buf.as_str()) {
+                        println!("Continuing...");
+                        break;
+                    }
+                    else if nos.contains(&buf.as_str()) {
+                        return Ok(());
+                    }
+                    else {
+                        print!("Please answer [y]es or [n]o: ");
+                    }
+                }
+                Err(_) => return Err(Unspecified),
+            }
+        }
+    }
+
+    let algo: &'static PqdsaSigningAlgorithm = match algo {
+        Algorithms::MLDSA44 => &ML_DSA_44_SIGNING,
+        Algorithms::MLDSA65 => &ML_DSA_65_SIGNING,
+        Algorithms::MLDSA87 => &ML_DSA_87_SIGNING,
+    };
+    let keypair = PqdsaKeyPair::generate(&algo)?;
+    let priv_key = keypair.to_pkcs8()?;
+    let pub_key = keypair.public_key().as_ref();
+    let mut priv_file = std::fs::File::create(path.join("mldsa")).expect("Failed to create file");
+    let mut pub_file = std::fs::File::create(path.join("mldsa.pub")).expect("Failed to create file");
+    priv_file.write_all(priv_key.as_ref()).unwrap();
+    pub_file.write_all(pub_key).unwrap();
+    Ok(())
+}
+
+fn handle_message(msg: String, shutdown: &atomic::AtomicBool) -> std::io::Result<()> {
     let msg = ConMsg::from_bytes(msg)?;
     match msg {
         ConMsg::Hello(_) => println!("Operation currently unsupported"),
@@ -21,7 +107,7 @@ fn handle_message(msg: String, shutdown: &atomic::AtomicBool) -> Result<()> {
     Ok(())
 }
 
-fn read_loop(mut sock: TcpStream, shutdown: &atomic::AtomicBool) -> Result<()> {
+fn read_loop(mut sock: TcpStream, shutdown: &atomic::AtomicBool) -> std::io::Result<()> {
     while !shutdown.load(atomic::Ordering::Relaxed) {
         let mut len_bytes: [u8; 4] = [0; 4];
         sock.read_exact(&mut len_bytes)?;
@@ -43,14 +129,14 @@ fn read_loop(mut sock: TcpStream, shutdown: &atomic::AtomicBool) -> Result<()> {
     Ok(())
 }
 
-fn client() -> Result<()> {
+fn client() -> std::io::Result<()> {
     // TODO: Add config, currently using canned example
     let port: u16 = 8080;
     let host = "localhost";
     let mut sock = TcpStream::connect((host, port))?;
     let shutdown = atomic::AtomicBool::new(false);
     let mut stdin = std::io::stdin();
-    thread::scope( |s| -> Result<()> {
+    thread::scope( |s| -> std::io::Result<()> {
         let listener = sock.try_clone()?;
         let reader = s.spawn(|| read_loop(listener, &shutdown));
         let mut keep_reading = true;
@@ -92,7 +178,18 @@ fn client() -> Result<()> {
         Ok(()) 
     })
 }
-fn main() -> Result<()>{
+fn main() -> Result<(), Box<dyn std::error::Error>>{
+    // Parse args
+    let argv = Argv::parse();
+    match argv.cmd {
+        Ops::Keygen{ algorithm, path } => {
+            generate_key(algorithm, &Path::new(&path))?;
+            return Ok(());
+        }
+        Ops::Run{ hostname, port } => {}
+    }
+
+
     // Set terminal into raw mode
     // SAFETY: termios struct guaranteed to be initialized by libc::tcgetattr
     let reset: MaybeUninit<libc::termios>;

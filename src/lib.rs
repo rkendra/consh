@@ -1,3 +1,7 @@
+#![allow(unused_imports)]
+use aws_lc_rs::error::Unspecified;
+use aws_lc_rs::signature::{UnparsedPublicKey, ED25519};
+use aws_lc_rs::unstable::signature::{ML_DSA_44, ML_DSA_65, ML_DSA_87};
 #[derive(PartialEq, Debug)]
 pub enum ConMsg {
     Hello(String),
@@ -57,6 +61,28 @@ impl ConMsg {
         }
     }
 }
+
+#[derive(Clone, Debug)]
+pub struct SigPublicKey {
+    trad_key_bytes: aws_lc_rs::signature::Ed25519PublicKey,
+    pqc_key_bytes: aws_lc_rs::unstable::signature::PqdsaPublicKey,
+}
+
+impl SigPublicKey {
+    pub fn as_bytes(&self) -> Vec<u8> {
+        [self.trad_key_bytes.as_ref(), self.pqc_key_bytes.as_ref()].concat()
+    }
+
+    pub fn verify(&self, msg: &[u8], ed_sig: &[u8], pqc_sig: &[u8]) -> Result<(), Unspecified> {
+        let ed_key = UnparsedPublicKey::new(&ED25519, self.trad_key_bytes.as_ref());
+        let pqc_key = UnparsedPublicKey::new(&ML_DSA_44, self.pqc_key_bytes.as_ref());
+        ed_key.verify(msg, ed_sig)?;
+        pqc_key.verify(msg, pqc_sig)
+    }
+}
+
+
+
 
 #[cfg(test)]
 mod tests {
