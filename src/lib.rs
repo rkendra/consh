@@ -2,13 +2,19 @@
 use aws_lc_rs::error::Unspecified;
 use aws_lc_rs::signature::{UnparsedPublicKey, ED25519};
 use aws_lc_rs::unstable::signature::{ML_DSA_44, ML_DSA_65, ML_DSA_87};
-#[derive(PartialEq, Debug)]
+use ciborium::{from_reader, into_writer};
+use time::OffsetDateTime;
+#[derive(PartialEq, Debug)] 
 pub enum ConMsg {
-    Hello(String),
-    End(String),
-    Command(String),
-    Error(String),
-    Timeout(String),
+    Hello(Vec<u8>),
+    End(Vec<u8>),
+    Command(Vec<u8>),
+    Error(Vec<u8>),
+    Challenge {
+        nonce: Vec<u8>,
+        timestamp: OffsetDateTime,
+        signature: Vec<u8>,
+    }
 }
 use ConMsg::*;
 
@@ -20,43 +26,48 @@ impl ConMsg {
                 let len = u32::try_from(m.len() + 1).expect("How is your command over 4 gigabytes?");
                 out.extend_from_slice(&len.to_be_bytes());
                 out.push(b'0');
-                out.extend_from_slice(m.as_bytes());
+                out.extend_from_slice(m);
             },
             End(m) => {
                 let len = u32::try_from(m.len() + 1).expect("How is your command over 4 gigabytes?");
                 out.extend_from_slice(&len.to_be_bytes());
                 out.push(b'1');
-                out.extend_from_slice(m.as_bytes());
+                out.extend_from_slice(m);
             },
             Command(m) => {
                 let len = u32::try_from(m.len() + 1).expect("How is your command over 4 gigabytes?");
                 out.extend_from_slice(&len.to_be_bytes());
                 out.push(b'2');
-                out.extend_from_slice(m.as_bytes());
+                out.extend_from_slice(m);
             },
             Error(m) => {
                 let len = u32::try_from(m.len() + 1).expect("How is your command over 4 gigabytes?");
                 out.extend_from_slice(&len.to_be_bytes());
                 out.push(b'3');
-                out.extend_from_slice(m.as_bytes());
+                out.extend_from_slice(m);
             },
-            Timeout(m) => {
-                let len = u32::try_from(m.len() + 1).expect("How is your command over 4 gigabytes?");
+            Challenge{nonce, timestamp, signature} => {
+                let mut time_bytes = Vec::new();
+                let _ = into_writer(&timestamp, &mut time_bytes);
+                let len = u32::try_from(nonce.len() + time_bytes.len() + signature.len() + 1)
+                    .expect("How is your command over 4 gigabytes?");
                 out.extend_from_slice(&len.to_be_bytes());
                 out.push(b'4');
-                out.extend_from_slice(m.as_bytes());
+                out.extend_from_slice(nonce);
+                out.extend_from_slice(&time_bytes);
+                out.extend_from_slice(signature);
             },
         }
         out
     }
 
-    pub fn from_bytes(msg: String) -> std::io::Result<ConMsg> {
-        match msg.chars().nth(0) {
-            Some('0') => Ok(Hello(msg[1..].to_string())),
-            Some('1') => Ok(End(msg[1..].to_string())),
-            Some('2') => Ok(Command(msg[1..].to_string())),
-            Some('3') => Ok(Error(msg[1..].to_string())),
-            Some('4') => Ok(Timeout(msg[1..].to_string())),
+    pub fn from_bytes(msg: &[u8]) -> std::io::Result<ConMsg> {
+        match msg[0] {
+            b'0' => Ok(Hello(msg[1..].to_vec())),
+            b'1' => Ok(End(msg[1..].to_vec())),
+            b'2' => Ok(Command(msg[1..].to_vec())),
+            b'3' => Ok(Error(msg[1..].to_vec())),
+            b'4' => Ok(Timeout(msg[1..].to_vec())),
             _ => Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "Unable to parse string")),
         }
     }
@@ -90,11 +101,11 @@ mod tests {
 
     #[test]
     fn msg_to_vec() {
-        let one: ConMsg = ConMsg::Hello(String::from("a"));
-        let two: ConMsg = ConMsg::End(String::from("ab"));
-        let three: ConMsg = ConMsg::Command(String::from("abc"));
-        let four: ConMsg = ConMsg::Error(String::from("abcd"));
-        let five: ConMsg = ConMsg::Timeout(String::from("abcde"));
+        let one: ConMsg = ConMsg::Hello(Vec::from(b"a"));
+        let two: ConMsg = ConMsg::End(Vec::from(b"ab"));
+        let three: ConMsg = ConMsg::Command(Vec::from(b"abc"));
+        let four: ConMsg = ConMsg::Error(Vec::from(b"abcd"));
+        let five: ConMsg = ConMsg::Timeout(Vec::from(b"abcde"));
         assert_eq!(one.to_bytes(), vec![b'\x00', b'\x00', b'\x00', b'\x02', b'0', b'a']);
         assert_eq!(two.to_bytes(), vec![b'\x00', b'\x00', b'\x00', b'\x03', b'1', b'a', b'b']);
         assert_eq!(three.to_bytes(), vec![b'\x00', b'\x00', b'\x00', b'\x04', b'2', b'a', b'b', b'c']);
@@ -104,15 +115,15 @@ mod tests {
 
     #[test]
     fn str_to_msg() {
-        let one: ConMsg = ConMsg::Hello(String::from("a"));
-        let two: ConMsg = ConMsg::End(String::from("ab"));
-        let three: ConMsg = ConMsg::Command(String::from("abc"));
-        let four: ConMsg = ConMsg::Error(String::from("abcd"));
-        let five: ConMsg = ConMsg::Timeout(String::from("abcde"));
-        assert_eq!(one, ConMsg::from_bytes(String::from("2:0a")).unwrap());
-        assert_eq!(two, ConMsg::from_bytes(String::from("3:1ab")).unwrap());
-        assert_eq!(three, ConMsg::from_bytes(String::from("4:2abc")).unwrap());
-        assert_eq!(four, ConMsg::from_bytes(String::from("5:3abcd")).unwrap());
-        assert_eq!(five, ConMsg::from_bytes(String::from("6:4abcde")).unwrap());
+        let one: ConMsg = ConMsg::Hello(Vec::from(b"a"));
+        let two: ConMsg = ConMsg::End(Vec::from(b"ab"));
+        let three: ConMsg = ConMsg::Command(Vec::from(b"abc"));
+        let four: ConMsg = ConMsg::Error(Vec::from(b"abcd"));
+        let five: ConMsg = ConMsg::Timeout(Vec::from(b"abcde"));
+        assert_eq!(one, ConMsg::from_bytes(b"2:0a").unwrap());
+        assert_eq!(two, ConMsg::from_bytes(b"3:1ab").unwrap());
+        assert_eq!(three, ConMsg::from_bytes(b"4:2abc").unwrap());
+        assert_eq!(four, ConMsg::from_bytes(b"5:3abcd").unwrap());
+        assert_eq!(five, ConMsg::from_bytes(b"6:4abcde").unwrap());
     }
 }

@@ -32,11 +32,11 @@ enum Commands {
     }
 }
 
-fn handle_message(msg: String, pipe: &mut PtyIn, shutdown: &mut bool) -> std::io::Result<()> {
+fn handle_message(msg: &[u8], pipe: &mut PtyIn, shutdown: &mut bool) -> std::io::Result<()> {
     let msg = ConMsg::from_bytes(msg)?;
     match msg {
         ConMsg::Hello(_) => warn!("Operation not implemented yet"),
-        ConMsg::Command(body) => pipe.write_all(body.as_bytes())?,
+        ConMsg::Command(body) => pipe.write_all(&body)?,
         ConMsg::End(_) => *shutdown = true,
         ConMsg::Error(_) => warn!("Operation not implemented yet"),
         ConMsg::Timeout(_) => warn!("Operation not implemented yet"),
@@ -75,8 +75,7 @@ fn shell_listener(sender: mpsc::Sender<ConMsg>, pipe: &mut PtyOut) {
             Ok(n) => {
                 let mut vec = Vec::new();
                 vec.extend_from_slice(&buf[0..n]);
-                let body = String::from_utf8(vec).expect("Shell only uses UTF-8");
-                sender.send(ConMsg::Command(body)).expect("Receiving thread panicked/terminated early");
+                sender.send(ConMsg::Command(vec)).expect("Receiving thread panicked/terminated early");
             },
             Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {
                 debug!("Interrupt occured, retrying");
@@ -183,9 +182,9 @@ fn client_handler(mut sock: TcpStream) -> std::io::Result<()> {
                     Err(e) => return Err(e),
                 }
             }
-            handle_message(str::from_utf8(&msg).unwrap().to_string(), &mut shell.input, &mut shutdown)?;
+            handle_message(&msg, &mut shell.input, &mut shutdown)?;
         }
-        let end = ConMsg::End(String::new());
+        let end = ConMsg::End(Vec::new());
         shell.input.write_all(b"\x04")?;
         sock.write_all(&end.to_bytes())?;
         Ok(())
