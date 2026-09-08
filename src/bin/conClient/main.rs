@@ -6,14 +6,15 @@ use std::thread;
 use std::sync::{atomic};
 use std::path::{Path, PathBuf};
 use clap::{Parser, Subcommand, ValueEnum};
-use aws_lc_rs::unstable::signature::{PqdsaKeyPair, PqdsaSigningAlgorithm, ML_DSA_44_SIGNING, ML_DSA_65_SIGNING, ML_DSA_87_SIGNING};
+use aws_lc_rs::signature::{PqdsaKeyPair, PqdsaSigningAlgorithm, ML_DSA_44_SIGNING, ML_DSA_65_SIGNING, ML_DSA_87_SIGNING};
 use aws_lc_rs::error::{KeyRejected, Unspecified};
 use aws_lc_rs::signature::KeyPair;
+use log::{debug, warn, error};
 
 #[derive(Parser)]
 #[command(version, about, long_about = None)]
 struct Argv {
-   #[command(subcommand)]
+    #[command(subcommand)]
     cmd: Ops,
 }
 
@@ -28,7 +29,11 @@ enum Ops {
 
         /// The port the host is listening on (if not default)
         #[arg(short, long, default_value_t = 1618)]
-        port: u16
+        port: u16,
+        
+        /// Print debug information to the console
+        #[arg(short, long)]
+        debug: bool,
     },
 
     /// Generate an authentication keypair for the current user/machine combination
@@ -86,7 +91,7 @@ fn generate_key(algo: Algorithms, path: &Path) -> Result<(), Unspecified> {
         Algorithms::MLDSA87 => &ML_DSA_87_SIGNING,
     };
     let keypair = PqdsaKeyPair::generate(&algo)?;
-    let priv_key = keypair.to_pkcs8()?;
+    let priv_key = keypair.to_pkcs8v1()?;
     println!("{}", priv_key.as_ref().len());
     let pub_key = keypair.public_key().as_ref();
     let mut priv_file = std::fs::File::create(path.join("mldsa")).expect("Failed to create file");
@@ -105,25 +110,28 @@ fn handle_message(msg: &[u8], shutdown: &atomic::AtomicBool) -> std::io::Result<
             stdout.write_all(&string)?;
             stdout.flush()?;
         },
-        ConMsg::End(_) => shutdown.store(true, atomic::Ordering::Relaxed),
+        ConMsg::End(_) => {
+            debug!("End signal received from server, quitting...");
+            shutdown.store(true, atomic::Ordering::Relaxed)
+        },
         ConMsg::Error(_) => println!("Operation currently unsupported"),
-        ConMsg::Timeout(_) => println!("Operation currently unsupported"),
+        ConMsg::Challenge { .. } => println!("Operation currently unsupported"),
     }
     Ok(())
 }
 
 fn read_loop(mut sock: TcpStream, shutdown: &atomic::AtomicBool) -> std::io::Result<()> {
     while !shutdown.load(atomic::Ordering::Relaxed) {
-        let mut len_bytes: [u8; 4] = [0; 4];
+        let mut len_bytes = [0u8; ConMsg::LEN_WIDTH];
         sock.read_exact(&mut len_bytes)?;
-        let msg_len = u32::from_be_bytes(len_bytes);
+        let msg_len = usize::from_be_bytes(len_bytes);
         let mut bytes_recd = 0;
         let mut msg = Vec::new();
         while bytes_recd < msg_len {
             let mut buf: Vec<u8> = vec![0; (msg_len - bytes_recd) as usize];
             match sock.read(&mut buf) {
                 Ok(n) => {
-                    bytes_recd += n as u32;
+                    bytes_recd += n;
                     msg.extend_from_slice(&buf[..n]);
                 },
                 Err(e) => return Err(e),
@@ -135,7 +143,13 @@ fn read_loop(mut sock: TcpStream, shutdown: &atomic::AtomicBool) -> std::io::Res
 }
 
 fn client(hostname: &str, port: u16, key_path: Option<&Path>) -> std::io::Result<()> {
-    let mut sock = TcpStream::connect((hostname, port))?;
+    let mut sock = match TcpStream::connect((hostname, port)) {
+        Ok(s) => s,
+        Err(e) => {
+            warn!("Connection to server failed! Is the server online?");
+            return Err(e);
+        }
+    };
     // Perform security handshake with server
     let keyfile: PathBuf;
     match key_path {
@@ -145,17 +159,24 @@ fn client(hostname: &str, port: u16, key_path: Option<&Path>) -> std::io::Result
             keyfile = PathBuf::from(format!("{home}/.consh/mldsa"));
         }
     }
-    let mut keyfile = std::fs::File::open(keyfile)?;
+    let mut keyfile = match std::fs::File::open(keyfile) {
+        Ok(key) => key,
+        Err(e) => {
+            error!("Fatal, could not open keyfile: No such file or directory");
+            return Err(e)
+        }
+    };
     let mut seed = String::new();
     keyfile.read_to_string(&mut seed)?;
     let key = match PqdsaKeyPair::from_pkcs8(&ML_DSA_44_SIGNING, seed.as_bytes()) {
         Ok(data) => data,
         Err(e) => return Err(std::io::Error::other(e))
     };
+    debug!("Successfully loaded MLDSA auth keypair");
     let hello_msg = ConMsg::Hello(key.public_key().as_ref().to_vec());
 
     sock.write_all(&hello_msg.to_bytes())?;
-
+    debug!("Hello message sent to server");
     
     let shutdown = atomic::AtomicBool::new(false);
     let mut stdin = std::io::stdin();
@@ -170,19 +191,35 @@ fn client(hostname: &str, port: u16, key_path: Option<&Path>) -> std::io::Result
                     if buf[0] == 4 {
                         let end_msg = ConMsg::End(Vec::new());
                         sock.write_all(&end_msg.to_bytes())?;
+                        debug!("Ctrl+D received, preparing to end transmission");
                         keep_reading = false;
                     } else {
                         let msg = buf[..n].to_vec(); 
                         let msg = ConMsg::Command(msg);
-                        sock.write_all(&msg.to_bytes())?;
+                        match sock.write_all(&msg.to_bytes()) {
+                            Ok(_) => {},
+                            Err(e) => {
+                                warn!("Failed to send packet to server");
+                                return Err(e);
+                            }
+                        }
                     }
                 },
                 Ok(n) => {
                     let msg = buf[..n].to_vec(); 
                     let msg = ConMsg::Command(msg);
-                    sock.write_all(&msg.to_bytes())?;
+                    match sock.write_all(&msg.to_bytes()) {
+                        Ok(_) => {},
+                        Err(e) => {
+                            warn!("Failed to send packet to server");
+                            return Err(e);
+                        }
+                    }
                 }
-                Err(e) => return Err(e),
+                Err(e) => {
+                    warn!("Could not read from terminal!");
+                    return Err(e);
+                },
             }
         }
         let _ = reader.join();
@@ -200,12 +237,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>>{
     let argv = Argv::parse();
     let mut host: String;
     let port_arg: u16;
+    let print_debug: bool;
     match argv.cmd {
         Ops::Keygen{ algorithm, path } => {
             generate_key(algorithm, &Path::new(&path))?;
             return Ok(());
         }
-        Ops::Run{ hostname, port } => {
+        Ops::Run{ hostname, port, debug } => {
             match hostname {
                 Some(name) => host = name,
                 None => { 
@@ -218,10 +256,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>>{
                 }
             }
             port_arg = port;
-                    
+            print_debug = debug;
         }
     }
 
+    // Create debug logging setup, if debug is enabled in args
+    let mut clog = colog::default_builder();
+    if print_debug {
+        clog.filter(None, log::LevelFilter::Debug);
+    } else {
+        clog.filter(None, log::LevelFilter::Error);
+    }
+    clog.init();
+    debug!("Preparing to connect to {host}");
 
     // Set terminal into raw mode
     // SAFETY: termios struct guaranteed to be initialized by libc::tcgetattr
