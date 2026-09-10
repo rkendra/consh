@@ -1,13 +1,14 @@
 use aws_lc_rs::signature::{ML_DSA_44, UnparsedPublicKey};
+use base64::{prelude::BASE64_STANDARD, read::DecoderReader, write::EncoderWriter};
 use clap::{Parser, Subcommand};
 use consh::ConMsg;
 use log::{debug, error, info, warn};
 use std::fs::File;
 use std::io::prelude::*;
-use std::io::{BufReader, ErrorKind};
+use std::io::{BufReader, Cursor, ErrorKind};
 use std::net::*;
 use std::path::{Path, PathBuf};
-use std::sync::mpsc;
+use std::sync::{Arc, atomic, mpsc};
 use std::thread;
 use subterminal::{Pty, PtyIn, PtyOut};
 
@@ -41,7 +42,9 @@ enum Commands {
     },
 }
 
-const CONFIG_DIR: &str = ".consh";
+const GLOBAL_CONFIG_DIR: &str = "/etc/consh";
+const USER_CONFIG_DIR: &str = ".consh";
+const MLDSA44_PUBKEYLEN: usize = 1312;
 
 fn handle_message(msg: &[u8], pipe: &mut PtyIn, shutdown: &mut bool) -> std::io::Result<()> {
     let msg = ConMsg::from_bytes(msg)?;
@@ -194,6 +197,30 @@ fn client_handler(mut sock: TcpStream) -> std::io::Result<()> {
     };
 
     // Check that given key is authorized
+    let allowlist = File::open(String::from(GLOBAL_CONFIG_DIR) + "/allowed_keys")?;
+    let mut key_buf = Vec::new();
+    let mut uname = String::new();
+    for line in BufReader::new(allowlist).lines() {
+        let line = match line {
+            Ok(data) => data,
+            Err(e) => {
+                return Err(e);
+            }
+        };
+        let mut parts = line.split_ascii_whitespace();
+        let b64_key = parts.next().unwrap();
+        DecoderReader::new(b64_key.as_bytes(), &BASE64_STANDARD).read_to_end(&mut key_buf)?;
+        if key_buf == client_key {
+            uname = String::from(parts.next().unwrap());
+            info!("located user {uname} associated with key");
+            break;
+        }
+    }
+
+    if uname == String::new() {
+        error!("Client sent an unrecognized key, quitting...");
+        return Err(std::io::Error::other("Unknown client"));
+    }
 
     let client_key = UnparsedPublicKey::new(&ML_DSA_44, client_key);
     let mut nonce = [0u8; 12];
@@ -240,26 +267,24 @@ fn client_handler(mut sock: TcpStream) -> std::io::Result<()> {
     // Verify that the nonce was the one generated, reject otherwise
     if challenge.0 != nonce {
         // Close the connection w/o notifying client
-        return Err(std::io::Error::other("Malicious client"));
+        return Err(std::io::Error::other("Invalid nonce"));
     }
 
     match client_key.verify(&challenge.0, &challenge.2) {
         Ok(_) => {}
         Err(_) => {
             error!("Client failed to produce valid signature, quitting...");
-            return Err(std::io::Error::other("Malicious client"));
+            return Err(std::io::Error::other("Invalid signature"));
         }
     }
 
-    warn!("Actual user handshake not implemented yet, using canned username");
-    let uname = "ryanj";
-    if !user_exists(uname) {
+    if !user_exists(uname.as_str()) {
         return Err(std::io::Error::other("User not found"));
     }
     // Start bash subprocess
     let cmd = String::from("/usr/bin/bash");
     debug!("command to be ran is {}", cmd);
-    let mut shell = Pty::spawn_as_user(&cmd, uname)?;
+    let mut shell = Pty::spawn_as_user(&cmd, uname.as_str())?;
     thread::sleep(std::time::Duration::from_millis(10));
 
     let (tx, rx) = mpsc::channel();
@@ -296,17 +321,47 @@ fn client_handler(mut sock: TcpStream) -> std::io::Result<()> {
 fn server_loop(port: u16) -> std::io::Result<()> {
     let addr = format!("0.0.0.0:{}", port);
     let server = TcpListener::bind(addr)?;
+    let num_cons = Arc::new(atomic::AtomicU8::new(0));
     info!("Server listening on port {}", port);
     for stream in server.incoming() {
-        let client_sock = stream?;
-        thread::spawn(|| client_handler(client_sock));
+        let mut client_sock = stream?;
+        if num_cons.load(atomic::Ordering::Acquire) >= 10 {
+            warn!("Max connections reached, refusing new connection");
+            let res = ConMsg::Error(Vec::from(b"Max connections reached")).to_bytes();
+            client_sock.write_all(&res)?;
+            continue;
+        }
+        num_cons.update(atomic::Ordering::AcqRel, atomic::Ordering::Acquire, |x| {
+            x + 1
+        });
+        let monitor = thread::spawn(|| client_handler(client_sock));
+        let con_update = num_cons.clone();
+        thread::spawn(move || {
+            match monitor.join() {
+                Ok(status) => match status {
+                    Ok(()) => {}
+                    Err(e) => {
+                        error!("Client socket disconnected unexpectedly: {}", e);
+                    }
+                },
+                Err(_) => {
+                    error!("Client thread panicked");
+                }
+            }
+            con_update.update(atomic::Ordering::AcqRel, atomic::Ordering::Acquire, |n| {
+                n - 1
+            });
+        });
     }
     Ok(())
 }
 
 fn main() -> Result<(), std::io::Error> {
+    // Create root config directory if one doesn't exist
+    if !Path::new(GLOBAL_CONFIG_DIR).exists() {
+        std::fs::create_dir(GLOBAL_CONFIG_DIR)?;
+    }
     let args = Argv::parse();
-    //TODO; Add more sophisticated argument parsing (external crate?)
     match &args.command {
         Commands::Run { port } => {
             // Log level is Debug for debug builds, info for release builds
@@ -327,11 +382,17 @@ fn main() -> Result<(), std::io::Error> {
                     "No such file or directory",
                 ));
             }
-            let userfile = format!(
-                "{}/{CONFIG_DIR}/{uname}.pub",
-                std::env::var("HOME").expect("Running user does not have a home directory")
-            );
-            std::fs::copy(keyfile, userfile)?;
+            let mut allowlist = File::options()
+                .create(true)
+                .append(true)
+                .open(String::from(GLOBAL_CONFIG_DIR) + "/allowed_keys")?;
+            std::io::copy(
+                &mut File::open(keyfile)?,
+                &mut EncoderWriter::new(&mut allowlist, &BASE64_STANDARD),
+            )?;
+            allowlist.write_all(b"\t")?;
+            allowlist.write_all(uname.as_bytes())?;
+            allowlist.write_all(b"\n")?;
             Ok(())
         }
     }
