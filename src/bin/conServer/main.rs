@@ -176,9 +176,11 @@ fn client_handler(mut sock: TcpStream) -> std::io::Result<()> {
     );
     // Receive key from client, ensure key is known, then send challenge
     let mut len_bytes = [0u8; ConMsg::LEN_WIDTH];
+    debug!("Preparing to read message length");
     sock.read_exact(&mut len_bytes)?;
     let msg_len = usize::from_be_bytes(len_bytes);
     let mut msg = vec![0u8; msg_len];
+    debug!("Reading Hello Message");
     sock.read_exact(&mut msg)?;
     let client_key = match ConMsg::from_bytes(&msg) {
         Ok(con_msg) => match con_msg {
@@ -237,10 +239,11 @@ fn client_handler(mut sock: TcpStream) -> std::io::Result<()> {
         timestamp: time::OffsetDateTime::now_utc(),
         signature: vec![0u8; 1],
     };
-
+    debug!("Sending challenge to client");
     sock.write_all(&challenge.to_bytes())?;
 
     // Verify signature from client
+    debug!("Receiving signature from client");
     sock.read_exact(&mut len_bytes)?;
     let msg_len = usize::from_be_bytes(len_bytes);
     let mut msg = vec![0u8; msg_len];

@@ -36,6 +36,10 @@ enum Ops {
         /// Print debug information to the console
         #[arg(short, long)]
         debug: bool,
+
+        /// Location of the key to use
+        #[arg(short, long)]
+        key_path: Option<String>,
     },
 
     /// Generate an authentication keypair for the current user/machine combination
@@ -162,9 +166,9 @@ fn client(hostname: &str, port: u16, key_path: Option<&Path>) -> std::io::Result
             return Err(e);
         }
     };
-    let mut seed = String::new();
-    keyfile.read_to_string(&mut seed)?;
-    let key = match PqdsaKeyPair::from_pkcs8(&ML_DSA_44_SIGNING, seed.as_bytes()) {
+    let mut seed = Vec::new();
+    keyfile.read_to_end(&mut seed)?;
+    let key = match PqdsaKeyPair::from_pkcs8(&ML_DSA_44_SIGNING, &seed) {
         Ok(data) => data,
         Err(e) => return Err(std::io::Error::other(e)),
     };
@@ -270,16 +274,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let argv = Argv::parse();
     let mut host: String;
     let port_arg: u16;
+    let key_name: String;
+    let keyfile: Option<&Path>;
     let print_debug: bool;
     match argv.cmd {
         Ops::Keygen { algorithm, path } => {
-            generate_key(algorithm, &Path::new(&path))?;
+            generate_key(algorithm, Path::new(&path))?;
             return Ok(());
         }
         Ops::Run {
             hostname,
             port,
             debug,
+            key_path,
         } => {
             match hostname {
                 Some(name) => host = name,
@@ -296,6 +303,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             port_arg = port;
             print_debug = debug;
+            keyfile = match key_path {
+                None => None,
+                Some(path) => {
+                    key_name = path;
+                    Some(Path::new(&key_name))
+                }
+            };
         }
     }
 
@@ -339,7 +353,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         panicker(info);
     }));
 
-    let _ = client(&host, port_arg, None);
+    match client(&host, port_arg, keyfile) {
+        Ok(_) => {}
+        Err(e) => println!("consh: {e}"),
+    }
 
     std::io::stdout().write_all(b"\x1b[?25h\x1b[0m\r\n")?;
     std::io::stdout().flush()?;
