@@ -2,6 +2,7 @@ use aws_lc_rs::signature::{ML_DSA_44, UnparsedPublicKey};
 use base64::{prelude::BASE64_STANDARD, read::DecoderReader, write::EncoderWriter};
 use clap::{Parser, Subcommand};
 use consh::ConMsg;
+use consh::auth;
 use log::{debug, error, info, warn};
 use std::fs::File;
 use std::io::prelude::*;
@@ -174,30 +175,7 @@ fn client_handler(mut sock: TcpStream) -> std::io::Result<()> {
         "Performing handshake from user at address {}",
         sock.peer_addr()?
     );
-    // Receive key from client, ensure key is known, then send challenge
-    let mut len_bytes = [0u8; ConMsg::LEN_WIDTH];
-    debug!("Preparing to read message length");
-    sock.read_exact(&mut len_bytes)?;
-    let msg_len = usize::from_be_bytes(len_bytes);
-    let mut msg = vec![0u8; msg_len];
-    debug!("Reading Hello Message");
-    sock.read_exact(&mut msg)?;
-    let client_key = match ConMsg::from_bytes(&msg) {
-        Ok(con_msg) => match con_msg {
-            ConMsg::Hello(key) => key,
-            _ => {
-                error!("Client sent invalid message, quitting...");
-                let error_msg = ConMsg::Error(Vec::from(b"Bad handshake opener")).to_bytes();
-                sock.write_all(&error_msg)?;
-                return Err(std::io::Error::other("Handshake failed"));
-            }
-        },
-        Err(e) => {
-            error!("Client sent malformed message, terminating thread...");
-            return Err(e);
-        }
-    };
-
+    let client_key = auth::receive_key(&mut sock)?;
     // Check that given key is authorized
     let allowlist = File::open(String::from(GLOBAL_CONFIG_DIR) + "/allowed_keys")?;
     let mut key_buf = Vec::new();
@@ -224,60 +202,11 @@ fn client_handler(mut sock: TcpStream) -> std::io::Result<()> {
         return Err(std::io::Error::other("Unknown client"));
     }
 
-    let client_key = UnparsedPublicKey::new(&ML_DSA_44, client_key);
-    let mut nonce = [0u8; 12];
-    match aws_lc_rs::rand::fill(&mut nonce) {
-        Ok(_) => {}
-        Err(_) => {
-            error!("Could not properly generate challenge, terminating thread...");
-            return Err(std::io::Error::other("RNG Failed"));
-        }
-    }
-
-    let challenge = ConMsg::Challenge {
-        nonce: Vec::from(nonce),
-        timestamp: time::OffsetDateTime::now_utc(),
-        signature: vec![0u8; 1],
-    };
-    debug!("Sending challenge to client");
-    sock.write_all(&challenge.to_bytes())?;
-
-    // Verify signature from client
-    debug!("Receiving signature from client");
-    sock.read_exact(&mut len_bytes)?;
-    let msg_len = usize::from_be_bytes(len_bytes);
-    let mut msg = vec![0u8; msg_len];
-    sock.read_exact(&mut msg)?;
-    let challenge = match ConMsg::from_bytes(&msg) {
-        Ok(con_msg) => match con_msg {
-            ConMsg::Challenge {
-                nonce,
-                timestamp,
-                signature,
-            } => (nonce, timestamp, signature),
-            _ => {
-                error!("Client sent invalid message, quitting...");
-                let error_msg = ConMsg::Error(Vec::from(b"Malformed signature message")).to_bytes();
-                sock.write_all(&error_msg)?;
-                return Err(std::io::Error::other("Handshake failed"));
-            }
-        },
+    match auth::challenge(&mut sock, &client_key, &ML_DSA_44) {
+        Ok(()) => info!("Client public key successfully verified, proceeding..."),
         Err(e) => {
-            error!("Client sent malformed message, terminating thread...");
-            return Err(e);
-        }
-    };
-    // Verify that the nonce was the one generated, reject otherwise
-    if challenge.0 != nonce {
-        // Close the connection w/o notifying client
-        return Err(std::io::Error::other("Invalid nonce"));
-    }
-
-    match client_key.verify(&challenge.0, &challenge.2) {
-        Ok(_) => {}
-        Err(_) => {
-            error!("Client failed to produce valid signature, quitting...");
-            return Err(std::io::Error::other("Invalid signature"));
+            error!("Handshake with client failed: {e}");
+            return Err(std::io::Error::other(format!("{e}")));
         }
     }
 
@@ -299,6 +228,7 @@ fn client_handler(mut sock: TcpStream) -> std::io::Result<()> {
         });
         s.spawn(|| shell_listener(tx, &mut shell.output));
         let mut shutdown = false;
+        let mut len_bytes = [0u8; ConMsg::LEN_WIDTH];
         while !shutdown {
             sock.read_exact(&mut len_bytes)?;
             let msg_len = usize::from_be_bytes(len_bytes);

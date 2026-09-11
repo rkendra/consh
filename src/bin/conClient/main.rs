@@ -170,7 +170,7 @@ fn client(hostname: &str, port: u16, key_path: Option<&Path>) -> std::io::Result
     keyfile.read_to_end(&mut seed)?;
     let key = match PqdsaKeyPair::from_pkcs8(&ML_DSA_44_SIGNING, &seed) {
         Ok(data) => data,
-        Err(e) => return Err(std::io::Error::other(e)),
+        Err(e) => return Err(Error::other(e)),
     };
     debug!("Successfully loaded MLDSA auth keypair");
     let hello_msg = ConMsg::Hello(key.public_key().as_ref().to_vec());
@@ -191,9 +191,7 @@ fn client(hostname: &str, port: u16, key_path: Option<&Path>) -> std::io::Result
             signature,
         } => (nonce, timestamp, signature),
         _ => {
-            return Err(std::io::Error::other(
-                "Malformed challenge response from server",
-            ));
+            return Err(Error::other("Malformed challenge response from server"));
         }
     };
 
@@ -201,9 +199,7 @@ fn client(hostname: &str, port: u16, key_path: Option<&Path>) -> std::io::Result
     match key.sign(&challenge.0, &mut signature) {
         Ok(_) => {}
         Err(_) => {
-            return Err(std::io::Error::other(
-                "Failed to generate signature for challenge",
-            ));
+            return Err(Error::other("Failed to generate signature for challenge"));
         }
     }
 
@@ -292,7 +288,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Some(name) => host = name,
                 None => {
                     if !config.join("default_host").exists() {
-                        return Err(Box::new(std::io::Error::other(
+                        return Err(Box::new(Error::other(
                             "No host provided, and a default host not set",
                         )));
                     }
