@@ -21,60 +21,11 @@ use ConMsg::*;
 
 impl ConMsg {
     pub const LEN_WIDTH: usize = std::mem::size_of::<usize>();
-    pub fn to_bytes(&self) -> Vec<u8> {
-        let mut out = Vec::new();
-        match self {
-            Hello(m) => {
-                let len = m.len() + 1;
-                assert_eq!(len.to_be_bytes().len(), Self::LEN_WIDTH);
-                out.extend_from_slice(&len.to_be_bytes());
-                out.push(b'0');
-                out.extend_from_slice(m);
-            }
-            End(m) => {
-                let len = m.len() + 1;
-                assert_eq!(len.to_be_bytes().len(), Self::LEN_WIDTH);
-                out.extend_from_slice(&len.to_be_bytes());
-                out.push(b'1');
-                out.extend_from_slice(m);
-            }
-            Command(m) => {
-                let len = m.len() + 1;
-                assert_eq!(len.to_be_bytes().len(), Self::LEN_WIDTH);
-                out.extend_from_slice(&len.to_be_bytes());
-                out.push(b'2');
-                out.extend_from_slice(m);
-            }
-            Error(m) => {
-                let len = m.len() + 1;
-                assert_eq!(len.to_be_bytes().len(), Self::LEN_WIDTH);
-                out.extend_from_slice(&len.to_be_bytes());
-                out.push(b'3');
-                out.extend_from_slice(m);
-            }
-            Challenge {
-                nonce,
-                timestamp,
-                signature,
-            } => {
-                let mut time_bytes = Vec::new();
-                let _ = into_writer(&timestamp, &mut time_bytes);
-                let len =
-                    nonce.len() + time_bytes.len() + signature.len() + 1 + Self::LEN_WIDTH * 3;
-                out.extend_from_slice(&len.to_be_bytes());
-                out.push(b'4');
-                out.extend_from_slice(&nonce.len().to_be_bytes());
-                out.extend_from_slice(nonce);
-                out.extend_from_slice(&time_bytes.len().to_be_bytes());
-                out.extend_from_slice(&time_bytes);
-                out.extend_from_slice(&signature.len().to_be_bytes());
-                out.extend_from_slice(signature);
-            }
-        }
-        out
-    }
+}
 
-    pub fn from_bytes(msg: &[u8]) -> std::io::Result<ConMsg> {
+impl TryFrom<&[u8]> for ConMsg {
+    type Error = std::io::Error;
+    fn try_from(msg: &[u8]) -> Result<Self, <Self as TryFrom<&[u8]>>::Error> {
         match msg[0] {
             b'0' => Ok(Hello(msg[1..].to_vec())),
             b'1' => Ok(End(msg[1..].to_vec())),
@@ -144,6 +95,68 @@ impl ConMsg {
     }
 }
 
+impl TryFrom<&Vec<u8>> for ConMsg {
+    type Error = std::io::Error;
+    fn try_from(msg: &Vec<u8>) -> Result<Self, <ConMsg as TryFrom<&Vec<u8>>>::Error> {
+        Self::try_from(msg.as_slice())
+    }
+}
+
+impl From<ConMsg> for Vec<u8> {
+    fn from(msg: ConMsg) -> Self {
+        let mut out = Vec::new();
+        match &msg {
+            Hello(m) => {
+                let len = m.len() + 1;
+                assert_eq!(len.to_be_bytes().len(), ConMsg::LEN_WIDTH);
+                out.extend_from_slice(&len.to_be_bytes());
+                out.push(b'0');
+                out.extend_from_slice(m);
+            }
+            End(m) => {
+                let len = m.len() + 1;
+                assert_eq!(len.to_be_bytes().len(), ConMsg::LEN_WIDTH);
+                out.extend_from_slice(&len.to_be_bytes());
+                out.push(b'1');
+                out.extend_from_slice(m);
+            }
+            Command(m) => {
+                let len = m.len() + 1;
+                assert_eq!(len.to_be_bytes().len(), ConMsg::LEN_WIDTH);
+                out.extend_from_slice(&len.to_be_bytes());
+                out.push(b'2');
+                out.extend_from_slice(m);
+            }
+            Error(m) => {
+                let len = m.len() + 1;
+                assert_eq!(len.to_be_bytes().len(), ConMsg::LEN_WIDTH);
+                out.extend_from_slice(&len.to_be_bytes());
+                out.push(b'3');
+                out.extend_from_slice(m);
+            }
+            Challenge {
+                nonce,
+                timestamp,
+                signature,
+            } => {
+                let mut time_bytes = Vec::new();
+                let _ = into_writer(&timestamp, &mut time_bytes);
+                let len =
+                    nonce.len() + time_bytes.len() + signature.len() + 1 + ConMsg::LEN_WIDTH * 3;
+                out.extend_from_slice(&len.to_be_bytes());
+                out.push(b'4');
+                out.extend_from_slice(&nonce.len().to_be_bytes());
+                out.extend_from_slice(nonce);
+                out.extend_from_slice(&time_bytes.len().to_be_bytes());
+                out.extend_from_slice(&time_bytes);
+                out.extend_from_slice(&signature.len().to_be_bytes());
+                out.extend_from_slice(signature);
+            }
+        }
+        out
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct SigPublicKey {
     trad_key_bytes: aws_lc_rs::signature::Ed25519PublicKey,
@@ -181,11 +194,12 @@ pub mod auth {
         let msg_len = usize::from_be_bytes(len_bytes);
         let mut msg = vec![0u8; msg_len];
         sock.read_exact(&mut msg)?;
-        let peer_key = match ConMsg::from_bytes(&msg) {
+        let peer_key = match ConMsg::try_from(&msg) {
             Ok(con_msg) => match con_msg {
                 ConMsg::Hello(key) => key,
                 _ => {
-                    let error_msg = ConMsg::Error(Vec::from(b"Bad handshake opener")).to_bytes();
+                    let error_msg: Vec<u8> =
+                        ConMsg::Error(Vec::from(b"Bad handshake opener")).into();
                     sock.write_all(&error_msg)?;
                     return Err(std::io::Error::other("Handshake failed"));
                 }
@@ -217,7 +231,7 @@ pub mod auth {
             timestamp: time::OffsetDateTime::now_utc(),
             signature: vec![0u8; 1],
         };
-        sock.write_all(&challenge.to_bytes())?;
+        sock.write_all(&Vec::from(challenge))?;
 
         // Verify signature from client
         let mut len_bytes = [0u8; ConMsg::LEN_WIDTH];
@@ -225,7 +239,7 @@ pub mod auth {
         let msg_len = usize::from_be_bytes(len_bytes);
         let mut msg = vec![0u8; msg_len];
         sock.read_exact(&mut msg)?;
-        let challenge = match ConMsg::from_bytes(&msg) {
+        let challenge = match ConMsg::try_from(&msg) {
             Ok(con_msg) => match con_msg {
                 ConMsg::Challenge {
                     nonce,
@@ -233,8 +247,8 @@ pub mod auth {
                     signature,
                 } => (nonce, timestamp, signature),
                 _ => {
-                    let error_msg =
-                        ConMsg::Error(Vec::from(b"Malformed signature message")).to_bytes();
+                    let error_msg: Vec<u8> =
+                        ConMsg::Error(Vec::from(b"Malformed signature message")).into();
                     sock.write_all(&error_msg)?;
                     return Err(Box::new(std::io::Error::other("Handshake failed")));
                 }
@@ -263,7 +277,7 @@ pub mod auth {
         let msg_len = usize::from_be_bytes(len_bytes);
         let mut challenge = vec![0u8; msg_len];
         sock.read_exact(&mut challenge)?;
-        let challenge = match ConMsg::from_bytes(&challenge)? {
+        let challenge = match ConMsg::try_from(&challenge)? {
             ConMsg::Challenge {
                 nonce,
                 timestamp,
@@ -285,7 +299,7 @@ pub mod auth {
             signature,
         };
 
-        sock.write_all(&response.to_bytes())?;
+        sock.write_all(&Vec::from(response))?;
         Ok(())
     }
 }
@@ -301,19 +315,19 @@ mod tests {
         let three: ConMsg = ConMsg::Command(Vec::from(b"abc"));
         let four: ConMsg = ConMsg::Error(Vec::from(b"abcd"));
         assert_eq!(
-            one.to_bytes(),
+            Vec::from(one),
             vec![b'\x00', b'\x00', b'\x00', b'\x02', b'0', b'a']
         );
         assert_eq!(
-            two.to_bytes(),
+            Vec::from(two),
             vec![b'\x00', b'\x00', b'\x00', b'\x03', b'1', b'a', b'b']
         );
         assert_eq!(
-            three.to_bytes(),
+            Vec::from(three),
             vec![b'\x00', b'\x00', b'\x00', b'\x04', b'2', b'a', b'b', b'c']
         );
         assert_eq!(
-            four.to_bytes(),
+            Vec::from(four),
             vec![
                 b'\x00', b'\x00', b'\x00', b'\x05', b'3', b'a', b'b', b'c', b'd'
             ]
@@ -326,9 +340,9 @@ mod tests {
         let two: ConMsg = ConMsg::End(Vec::from(b"ab"));
         let three: ConMsg = ConMsg::Command(Vec::from(b"abc"));
         let four: ConMsg = ConMsg::Error(Vec::from(b"abcd"));
-        assert_eq!(one, ConMsg::from_bytes(b"2:0a").unwrap());
-        assert_eq!(two, ConMsg::from_bytes(b"3:1ab").unwrap());
-        assert_eq!(three, ConMsg::from_bytes(b"4:2abc").unwrap());
-        assert_eq!(four, ConMsg::from_bytes(b"5:3abcd").unwrap());
+        assert_eq!(one, ConMsg::try_from(b"2:0a" as &[u8]).unwrap());
+        assert_eq!(two, ConMsg::try_from(b"3:1ab" as &[u8]).unwrap());
+        assert_eq!(three, ConMsg::try_from(b"4:2abc" as &[u8]).unwrap());
+        assert_eq!(four, ConMsg::try_from(b"5:3abcd" as &[u8]).unwrap());
     }
 }

@@ -29,7 +29,10 @@ enum Commands {
     },
 
     /// Generate a new MLDSA_44 keypair for the server
-    Keygen {},
+    Keygen {
+        #[arg(value_name = "PATH", default_value_t = USER_CONFIG_DIR.into())]
+        path: String,
+    },
 
     /// Register a MLDSA_44 key with a specific user
     /// A key will attempt to log in the user it is associated with
@@ -45,10 +48,9 @@ enum Commands {
 
 const GLOBAL_CONFIG_DIR: &str = "/etc/consh";
 const USER_CONFIG_DIR: &str = ".consh";
-const MLDSA44_PUBKEYLEN: usize = 1312;
 
 fn handle_message(msg: &[u8], pipe: &mut PtyIn, shutdown: &mut bool) -> std::io::Result<()> {
-    let msg = ConMsg::from_bytes(msg)?;
+    let msg = ConMsg::try_from(msg)?;
     match msg {
         ConMsg::Hello(_) => warn!("Operation not implemented yet"),
         ConMsg::Command(body) => pipe.write_all(&body)?,
@@ -69,7 +71,7 @@ fn send_loop(queue: mpsc::Receiver<ConMsg>, mut sock: TcpStream) {
                 return;
             }
         };
-        let body: Vec<u8> = msg.to_bytes();
+        let body: Vec<u8> = msg.into();
         let bytes_len: usize = body.len();
         let mut bytes_sent: usize = 0;
         while bytes_sent < bytes_len {
@@ -210,6 +212,8 @@ fn client_handler(mut sock: TcpStream) -> std::io::Result<()> {
         }
     }
 
+    // Begin key-exchange with client
+
     if !user_exists(uname.as_str()) {
         return Err(std::io::Error::other("User not found"));
     }
@@ -244,7 +248,7 @@ fn client_handler(mut sock: TcpStream) -> std::io::Result<()> {
         }
         let end = ConMsg::End(Vec::new());
         shell.input.write_all(b"\x04")?;
-        sock.write_all(&end.to_bytes())?;
+        sock.write_all(&Vec::from(end))?;
         Ok(())
     })
 }
@@ -260,7 +264,7 @@ fn server_loop(port: u16) -> std::io::Result<()> {
         let mut client_sock = stream?;
         if num_cons.load(atomic::Ordering::Acquire) >= 10 {
             warn!("Max connections reached, refusing new connection");
-            let res = ConMsg::Error(Vec::from(b"Max connections reached")).to_bytes();
+            let res: Vec<u8> = ConMsg::Error(Vec::from(b"Max connections reached")).into();
             client_sock.write_all(&res)?;
             continue;
         }
@@ -305,7 +309,7 @@ fn main() -> Result<(), std::io::Error> {
             clog.init();
             server_loop(*port)
         }
-        Commands::Keygen {} => Ok(()),
+        Commands::Keygen { path } => Ok(()),
 
         Commands::AddUser { uname, keyfile } => {
             if !std::fs::exists(keyfile)? {

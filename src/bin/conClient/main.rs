@@ -107,7 +107,7 @@ fn generate_key(algo: Algorithms, path: &Path) -> Result<(), Unspecified> {
 }
 
 fn handle_message(msg: &[u8], shutdown: &atomic::AtomicBool) -> std::io::Result<()> {
-    let msg = ConMsg::from_bytes(msg)?;
+    let msg = ConMsg::try_from(msg)?;
     match msg {
         ConMsg::Hello(_) => println!("Operation currently unsupported"),
         ConMsg::Command(string) => {
@@ -175,7 +175,7 @@ fn client(hostname: &str, port: u16, key_path: Option<&Path>) -> std::io::Result
     debug!("Successfully loaded MLDSA auth keypair");
     let hello_msg = ConMsg::Hello(key.public_key().as_ref().to_vec());
 
-    sock.write_all(&hello_msg.to_bytes())?;
+    sock.write_all(&Vec::from(hello_msg))?;
     debug!("Hello message sent to server");
 
     // Receive and respond to server Challenge
@@ -184,7 +184,7 @@ fn client(hostname: &str, port: u16, key_path: Option<&Path>) -> std::io::Result
     let msg_len = usize::from_be_bytes(len_bytes);
     let mut challenge = vec![0u8; msg_len];
     sock.read_exact(&mut challenge)?;
-    let challenge = match ConMsg::from_bytes(&challenge)? {
+    let challenge = match ConMsg::try_from(&challenge)? {
         ConMsg::Challenge {
             nonce,
             timestamp,
@@ -209,7 +209,7 @@ fn client(hostname: &str, port: u16, key_path: Option<&Path>) -> std::io::Result
         signature,
     };
 
-    sock.write_all(&response.to_bytes())?;
+    sock.write_all(&Vec::from(response))?;
 
     let shutdown = atomic::AtomicBool::new(false);
     let mut stdin = std::io::stdin();
@@ -223,13 +223,13 @@ fn client(hostname: &str, port: u16, key_path: Option<&Path>) -> std::io::Result
                 Ok(n) if n == 1 => {
                     if buf[0] == 4 {
                         let end_msg = ConMsg::End(Vec::new());
-                        sock.write_all(&end_msg.to_bytes())?;
+                        sock.write_all(&Vec::from(end_msg))?;
                         debug!("Ctrl+D received, preparing to end transmission");
                         keep_reading = false;
                     } else {
                         let msg = buf[..n].to_vec();
                         let msg = ConMsg::Command(msg);
-                        match sock.write_all(&msg.to_bytes()) {
+                        match sock.write_all(&Vec::from(msg)) {
                             Ok(_) => {}
                             Err(e) => {
                                 warn!("Failed to send packet to server");
@@ -241,7 +241,7 @@ fn client(hostname: &str, port: u16, key_path: Option<&Path>) -> std::io::Result
                 Ok(n) => {
                     let msg = buf[..n].to_vec();
                     let msg = ConMsg::Command(msg);
-                    match sock.write_all(&msg.to_bytes()) {
+                    match sock.write_all(&Vec::from(msg)) {
                         Ok(_) => {}
                         Err(e) => {
                             warn!("Failed to send packet to server");
