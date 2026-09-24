@@ -3,6 +3,11 @@ use aws_lc_rs::signature::KeyPair;
 use aws_lc_rs::signature::{
     ML_DSA_44_SIGNING, ML_DSA_65_SIGNING, ML_DSA_87_SIGNING, PqdsaKeyPair, PqdsaSigningAlgorithm,
 };
+use aws_lc_rs::{
+    aead::{AES_256_GCM, RandomizedNonceKey},
+    kdf::{SskdfDigestAlgorithm, SskdfDigestAlgorithmId, get_sskdf_digest_algorithm, sskdf_digest},
+    kem::{Ciphertext, DecapsulationKey, ML_KEM_1024},
+};
 use clap::{Parser, Subcommand, ValueEnum};
 use consh::ConMsg;
 use log::{debug, error, warn};
@@ -143,14 +148,52 @@ fn read_loop(mut sock: TcpStream, shutdown: &atomic::AtomicBool) -> std::io::Res
     Ok(())
 }
 
-fn client(hostname: &str, port: u16, key_path: Option<&Path>) -> std::io::Result<()> {
+fn encrypt_connection(sock: &mut TcpStream) -> Result<RandomizedNonceKey, Box<dyn std::error::Error>> {
+    let decap = DecapsulationKey::generate(&ML_KEM_1024)?;
+    let encap = decap.encapsulation_key()?;
+    let encap_bytes = encap.key_bytes()?;
+    let encap_bytes = encap_bytes.as_ref();
+    let init_msg = ConMsg::Hello(Vec::from(encap_bytes));
+
+    sock.write_all(&Vec::from(init_msg))?;
+
+    // Derive shared secret from server
+    let mut len_bytes = [0u8; ConMsg::LEN_WIDTH];
+    sock.read_exact(&mut len_bytes)?;
+    let msg_len = usize::from_be_bytes(len_bytes);
+    let mut msg = vec![0u8; msg_len];
+    sock.read_exact(&mut msg)?;
+
+    let cipher = match ConMsg::try_from(&msg)? {
+        ConMsg::Hello(bytes) => bytes,
+        _ => {
+            return Err(Box::new(std::io::Error::other(
+                "Server did not follow protocol",
+            )));
+        }
+    };
+
+    let cipher = decap.decapsulate(Ciphertext::from(cipher))?;
+    let cipher = cipher.as_ref();
+
+    let 
+
+    Ok(())
+}
+
+fn client(
+    hostname: &str,
+    port: u16,
+    key_path: Option<&Path>,
+) -> Result<(), Box<dyn std::error::Error>> {
     let mut sock = match TcpStream::connect((hostname, port)) {
         Ok(s) => s,
         Err(e) => {
             warn!("Connection to server failed! Is the server online?");
-            return Err(e);
+            return Err(Box::new(e));
         }
     };
+
     // Perform security handshake with server
     let keyfile = match key_path {
         Some(path) => path.join("mldsa"),
@@ -163,14 +206,14 @@ fn client(hostname: &str, port: u16, key_path: Option<&Path>) -> std::io::Result
         Ok(key) => key,
         Err(e) => {
             error!("Fatal, could not open keyfile: No such file or directory");
-            return Err(e);
+            return Err(Box::new(e));
         }
     };
     let mut seed = Vec::new();
     keyfile.read_to_end(&mut seed)?;
     let key = match PqdsaKeyPair::from_pkcs8(&ML_DSA_44_SIGNING, &seed) {
         Ok(data) => data,
-        Err(e) => return Err(Error::other(e)),
+        Err(e) => return Err(Box::new(Error::other(e))),
     };
     debug!("Successfully loaded MLDSA auth keypair");
     let hello_msg = ConMsg::Hello(key.public_key().as_ref().to_vec());
@@ -191,7 +234,9 @@ fn client(hostname: &str, port: u16, key_path: Option<&Path>) -> std::io::Result
             signature,
         } => (nonce, timestamp, signature),
         _ => {
-            return Err(Error::other("Malformed challenge response from server"));
+            return Err(Box::new(Error::other(
+                "Malformed challenge response from server",
+            )));
         }
     };
 
@@ -199,7 +244,9 @@ fn client(hostname: &str, port: u16, key_path: Option<&Path>) -> std::io::Result
     match key.sign(&challenge.0, &mut signature) {
         Ok(_) => {}
         Err(_) => {
-            return Err(Error::other("Failed to generate signature for challenge"));
+            return Err(Box::new(Error::other(
+                "Failed to generate signature for challenge",
+            )));
         }
     }
 
@@ -213,7 +260,7 @@ fn client(hostname: &str, port: u16, key_path: Option<&Path>) -> std::io::Result
 
     let shutdown = atomic::AtomicBool::new(false);
     let mut stdin = std::io::stdin();
-    thread::scope(|s| -> std::io::Result<()> {
+    thread::scope(|s| -> Result<(), Box<dyn std::error::Error>> {
         let listener = sock.try_clone()?;
         let reader = s.spawn(|| read_loop(listener, &shutdown));
         let mut keep_reading = true;
@@ -233,7 +280,7 @@ fn client(hostname: &str, port: u16, key_path: Option<&Path>) -> std::io::Result
                             Ok(_) => {}
                             Err(e) => {
                                 warn!("Failed to send packet to server");
-                                return Err(e);
+                                return Err(Box::new(e));
                             }
                         }
                     }
@@ -245,13 +292,13 @@ fn client(hostname: &str, port: u16, key_path: Option<&Path>) -> std::io::Result
                         Ok(_) => {}
                         Err(e) => {
                             warn!("Failed to send packet to server");
-                            return Err(e);
+                            return Err(Box::new(e));
                         }
                     }
                 }
                 Err(e) => {
                     warn!("Could not read from terminal!");
-                    return Err(e);
+                    return Err(Box::new(e));
                 }
             }
         }
