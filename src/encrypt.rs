@@ -1,5 +1,6 @@
 use crate::ConMsg;
 use crate::auth::{challenge, prove, receive_key};
+use aws_lc_rs::cipher::AES_256_KEY_LEN;
 use aws_lc_rs::rand::Random;
 use aws_lc_rs::{
     aead::{AES_256_GCM, Aad, Algorithm, RandomizedNonceKey},
@@ -22,10 +23,7 @@ pub struct EncryptStream {
     recv_buf: Vec<u8>,
 }
 
-pub struct EncryptListener {
-    inner: TcpListener,
-    id: PqdsaKeyPair,
-}
+pub struct EncryptListener(TcpListener);
 
 pub trait KeyValidate {
     type Error;
@@ -44,19 +42,8 @@ impl<F: Fn(&[u8]) -> Result<(), E>, E> KeyValidate for F {
 impl EncryptStream {
     pub fn connect<A: ToSocketAddrs, K: KeyValidate>(
         addr: A,
-        algo: super::PqKeyAlgorithm,
     ) -> Result<Self, Box<dyn std::error::Error>> {
-
-        // Perform identity check of key, if specified, then validate public keys
         let mut sock = TcpStream::connect(addr)?;
-        let server_key = receive_key(&mut sock)?;
-        if let Some(validator) = validator {
-            let result = validator.validate(&server_key);
-        }
-        challenge(&mut sock, &server_key, algo.validating())?;
-        prove(&mut sock, id, algo.signing())?;
-
-        // Perform Key Encapsulation
         let decap = DecapsulationKey::generate(&ML_KEM_1024)?;
         let encap = decap.encapsulation_key()?;
         let encap_bytes = encap.key_bytes()?;
@@ -73,7 +60,7 @@ impl EncryptStream {
         sock.read_exact(&mut msg)?;
 
         let cipher = match ConMsg::try_from(&msg)? {
-            ConMsg::Hello(bytes) => bytes,
+            ConMsg::Encapsulation(bytes) => bytes,
             _ => {
                 return Err(Box::new(std::io::Error::other(
                     "Server did not follow protocol",
@@ -81,14 +68,51 @@ impl EncryptStream {
             }
         };
 
-        let cipher = decap.decapsulate(Ciphertext::from(cipher))?;
+        let cipher = decap.decapsulate(Ciphertext::from(cipher.as_ref()))?;
         let cipher = cipher.as_ref();
 
-        let 
+        let info = b"consh-client";
+        let mut send_key = vec![0u8; AES_256_GCM.key_len()];
+        let kdf_digest = match get_sskdf_digest_algorithm(SskdfDigestAlgorithmId::Sha256) {
+            Some(digest) => digest,
+            None => {
+                return Err(Box::new(aws_lc_rs::error::Unspecified {}));
+            }
+        };
+        sskdf_digest(kdf_digest, cipher, info, &mut send_key)?;
+        let send_key = RandomizedNonceKey::new(&AES_256_GCM, &send_key)?;
 
+        sock.read_exact(&mut len_bytes)?;
+        let msg_len = usize::from_be_bytes(len_bytes);
+        msg = vec![0u8; msg_len];
+        sock.read_exact(&mut msg)?;
+        let encap_bytes = match ConMsg::try_from(&msg)? {
+            ConMsg::Hello(bytes) => bytes,
+            _ => {
+                return Err(Box::new(std::io::Error::other(
+                    "Server did not follow protocol",
+                )));
+            }
+        };
+        let encap = EncapsulationKey::new(&ML_KEM_1024, &encap_bytes)?;
+        let (cipher, server_secret) = encap.encapsulate()?;
+
+        sock.write_all(cipher.as_ref())?;
+        let mut recv_key = vec![0u8; AES_256_KEY_LEN];
+        sskdf_digest(kdf_digest, server_secret.as_ref(), info, &mut recv_key)?;
+
+        let recv_key = RandomizedNonceKey::new(&AES_256_GCM, &recv_key)?;
+
+        Ok(EncryptStream {
+            inner: sock,
+            send_key,
+            recv_key,
+            algo: AES_256_GCM,
+            cipher_buf: Vec::new(),
+            recv_buf: Vec::new(),
+            decrypt_buf: Vec::new(),
+        })
     }
-
-    fn gen_send_key()
 }
 
 impl Read for EncryptStream {
@@ -120,9 +144,48 @@ impl Read for EncryptStream {
                 return Ok(bytes_written);
             }
         }
-        if self.
+        let expected_winsize =
+            buf.len() + self.algo.nonce_len() + self.algo.tag_len() + size_of::<usize>();
+        let bytes_to_recv: usize;
+        if !self.recv_buf.is_empty() {
+            if self.recv_buf.len() < size_of::<usize>() {
+                bytes_to_recv = expected_winsize - self.recv_buf.len();
+            } else {
+                bytes_to_recv =
+                    usize::from_be_bytes(self.recv_buf[..size_of::<usize>()].try_into().unwrap())
+                        - self.recv_buf.len();
+            }
+        } else {
+            bytes_to_recv = expected_winsize;
+        }
 
-        Ok(buf.len())
+        let mut msg = vec![0u8; bytes_to_recv];
+        let bytes_read = self.inner.read(&mut msg)?;
+        self.recv_buf.extend_from_slice(&msg);
+
+        if bytes_read < bytes_to_recv {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                "Did not receive entire frame",
+            ));
+        }
+
+        let msg_nolen = &mut msg[size_of::<usize>()..];
+        let (nonce, ctext) = msg_nolen.split_at_mut(self.algo.nonce_len());
+        let nonce = aws_lc_rs::aead::Nonce::try_assume_unique_for_key(nonce).unwrap();
+        let ptext = match self.recv_key.open_in_place(nonce, Aad::empty(), ctext) {
+            Ok(res) => res,
+            Err(_) => {
+                return Err(std::io::Error::other("Invalid ciphertext"));
+            }
+        };
+
+        let mut writer = buf;
+        let written = writer.write(ptext)?;
+        if written < ptext.len() {
+            self.decrypt_buf.extend_from_slice(&ptext[written..]);
+        }
+        Ok(written)
     }
 }
 
@@ -145,14 +208,16 @@ impl Write for EncryptStream {
         }
         let mut raw_buf = Vec::new();
         let mut seal = buf.to_vec();
-        let nonce = self.key.seal_in_place_append_tag(Aad::empty(), &mut seal);
+        let nonce = self
+            .send_key
+            .seal_in_place_append_tag(Aad::empty(), &mut seal);
         match nonce {
             Ok(n_bytes) => {
                 let frame_len = self.algo.nonce_len() + seal.len();
                 raw_buf.extend_from_slice(&frame_len.to_be_bytes());
                 raw_buf.extend_from_slice(n_bytes.as_ref());
                 raw_buf.extend_from_slice(&seal);
-                let bytes_written = self.inner.write(&buf)?;
+                let bytes_written = self.inner.write(buf)?;
                 self.cipher_buf.extend_from_slice(&raw_buf[bytes_written..]);
                 Ok(buf.len())
             }
@@ -187,7 +252,7 @@ impl Write for EncryptStream {
                     ));
                 }
                 Ok(n) => {
-                    self.flush();
+                    self.flush()?;
                     buf = &buf[n..];
                 }
                 Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => {}
@@ -195,5 +260,15 @@ impl Write for EncryptStream {
             }
         }
         Ok(())
+    }
+}
+
+impl EncryptListener {
+    pub fn as_inner(&self) -> &TcpListener {
+        &self.0
+    }
+
+    pub fn as_inner_mut(&mut self) -> &mut TcpListener {
+        &mut self.0
     }
 }

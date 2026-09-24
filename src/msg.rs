@@ -5,6 +5,7 @@ use time::OffsetDateTime;
 #[derive(PartialEq, Debug)]
 pub enum ConMsg {
     Hello(Vec<u8>),
+    Encapsulation(Vec<u8>),
     End(Vec<u8>),
     Command(Vec<u8>),
     Error(Vec<u8>),
@@ -84,6 +85,9 @@ impl TryFrom<&[u8]> for ConMsg {
                     signature,
                 })
             }
+
+            b'5' => Ok(Encapsulation(msg[1..].to_vec())),
+
             _ => Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 "Unable to parse string",
@@ -148,6 +152,14 @@ impl From<ConMsg> for Vec<u8> {
                 out.extend_from_slice(&time_bytes);
                 out.extend_from_slice(&signature.len().to_be_bytes());
                 out.extend_from_slice(signature);
+            }
+
+            Encapsulation(m) => {
+                let len = m.len() + 1;
+                assert_eq!(len.to_be_bytes().len(), ConMsg::LEN_WIDTH);
+                out.extend_from_slice(&len.to_be_bytes());
+                out.push(b'5');
+                out.extend_from_slice(m);
             }
         }
         out
